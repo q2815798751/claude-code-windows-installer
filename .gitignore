@@ -1,0 +1,25 @@
+# 官方载荷（约 95 MB），不入版本库 —— 用 build/fetch-payload.ps1 拉取
+payload/*.zip
+payload/*.tar.gz
+
+# 构建中间产物
+build/work/
+build/tmp/
+staging/
+
+# 构建期生成的版本与哈希
+src/BuildInfo.cs
+
+# 产物
+dist/
+
+# 编辑器
+.vs/
+.idea/
+*.user
+*.suo
+*~
+
+# 临时脚本与日志
+logs/
+build/work/

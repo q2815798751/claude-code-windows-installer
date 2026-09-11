@@ -1,0 +1,223 @@
+# build.ps1 - helper for packaging the Claude Code one-click installer.
+# ASCII-only on purpose: Windows PowerShell 5.1 mis-decodes non-BOM UTF-8 scripts.
+#
+# Actions:
+#   prep    verify official payload hash, extract claude.exe, emit BuildInfo.cs + build.vars.bat
+#   pack    stub.exe + payload.zip + trailer  ->  ClaudeCodeSetup.exe
+#   verify  re-read the produced exe, validate trailer and payload hash
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet('prep', 'pack', 'verify', 'hash')]
+    [string]$Action,
+
+    [string]$Root,
+    [string]$Stub,
+    [string]$Payload,
+    [string]$Out,
+    [string]$ShaFile,
+    [string]$WorkDir,
+    [string]$ExpectPayloadSha,
+    [string]$File
+)
+
+$ErrorActionPreference = 'Stop'
+$Magic = 'CLDCDSETUP-TRAIL'
+$MagicBytes = [Text.Encoding]::ASCII.GetBytes($Magic)
+
+function Get-Sha256Hex([string]$path) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fs = [IO.File]::Open($path, 'Open', 'Read', 'Read')
+    try {
+        $buf = New-Object byte[] (1MB)
+        while (($n = $fs.Read($buf, 0, $buf.Length)) -gt 0) {
+            $sha.TransformBlock($buf, 0, $n, $null, 0) | Out-Null
+        }
+        $sha.TransformFinalBlock((New-Object byte[] 0), 0, 0) | Out-Null
+        return (($sha.Hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $fs.Close(); $sha.Dispose()
+    }
+}
+
+function Get-Sha256Region([string]$path, [long]$offset, [long]$length) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $fs = [IO.File]::Open($path, 'Open', 'Read', 'Read')
+    try {
+        $fs.Seek($offset, 'Begin') | Out-Null
+        $buf = New-Object byte[] (1MB)
+        $remaining = $length
+        while ($remaining -gt 0) {
+            $want = [Math]::Min([long]$buf.Length, $remaining)
+            $n = $fs.Read($buf, 0, [int]$want)
+            if ($n -le 0) { break }
+            $sha.TransformBlock($buf, 0, $n, $null, 0) | Out-Null
+            $remaining -= $n
+        }
+        $sha.TransformFinalBlock((New-Object byte[] 0), 0, 0) | Out-Null
+        return (($sha.Hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $fs.Close(); $sha.Dispose()
+    }
+}
+
+function Read-Shasums([string]$path) {
+    $map = @{}
+    foreach ($line in (Get-Content -LiteralPath $path)) {
+        if ($line -match '^\s*([0-9a-fA-F]{64})\s+[*]?\s*(.+?)\s*$') {
+            $map[$matches[2]] = $matches[1].ToLowerInvariant()
+        }
+    }
+    return $map
+}
+
+switch ($Action) {
+
+    'hash' {
+        $h = Get-Sha256Hex $File
+        if ($Out) { [IO.File]::WriteAllText($Out, $h) } else { Write-Output $h }
+        break
+    }
+
+    'prep' {
+        $verFile = Join-Path $Root 'VERSION'
+        if (-not (Test-Path $verFile)) { throw "VERSION file not found: $verFile" }
+        $version = (Get-Content -LiteralPath $verFile -Raw).Trim()
+        $tag = "v$version"
+
+        $assetName = Split-Path $Payload -Leaf
+        $shasums = Read-Shasums $ShaFile
+        if (-not $shasums.ContainsKey($assetName)) {
+            throw "Asset '$assetName' not present in $ShaFile"
+        }
+        $official = $shasums[$assetName]
+
+        Write-Host "  official SHA256 ($assetName): $official"
+        $actual = Get-Sha256Hex $Payload
+        Write-Host "  local    SHA256 ($assetName): $actual"
+        if ($actual -ne $official) {
+            throw "PAYLOAD HASH MISMATCH - refusing to build. expected $official got $actual"
+        }
+        Write-Host "  payload hash matches official SHASUMS256.txt" -ForegroundColor Green
+
+        # Extract claude.exe so we can pin the post-extraction hash too.
+        $extractDir = Join-Path $WorkDir 'extract'
+        if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+        New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $zip = [IO.Compression.ZipFile]::OpenRead($Payload)
+        try {
+            $entry = $zip.Entries | Where-Object { $_.Name -eq 'claude.exe' } | Select-Object -First 1
+            if (-not $entry) { throw "claude.exe not found inside $assetName" }
+            $dest = Join-Path $extractDir 'claude.exe'
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $dest, $true)
+            $entry = $null
+        } finally {
+            $zip.Dispose()
+        }
+
+        $binSha = Get-Sha256Hex (Join-Path $extractDir 'claude.exe')
+        $binLen = (Get-Item (Join-Path $extractDir 'claude.exe')).Length
+        Write-Host "  extracted claude.exe: $binLen bytes, SHA256 $binSha"
+
+        # ARM64 payload is not bundled - it must be fetchable when running on ARM64.
+        $armAsset = 'claude-win32-arm64.zip'
+        $armSha = ''
+        if ($shasums.ContainsKey($armAsset)) { $armSha = $shasums[$armAsset] }
+        Write-Host "  official SHA256 ($armAsset): $armSha"
+
+        # Emit BuildInfo.cs consumed by the installer sources.
+        $bi = @"
+// AUTO-GENERATED by build/build.ps1 -- do not edit by hand.
+namespace ClaudeCodeSetup
+{
+    internal static class BuildInfo
+    {
+        internal const string ReleaseVersion = "$version";
+        internal const string ReleaseTag     = "$tag";
+        internal const string AssetName      = "$assetName";
+        internal const string ReleaseUrl     = "https://github.com/anthropics/claude-code/releases/tag/$tag";
+        internal const string PayloadSha256  = "$official";
+        internal const string BinarySha256   = "$binSha";
+        internal const string Arm64AssetName = "$armAsset";
+        internal const string Arm64Sha256    = "$armSha";
+    }
+}
+"@
+        $biPath = Join-Path $Root 'src\BuildInfo.cs'
+        [IO.File]::WriteAllText($biPath, $bi, (New-Object Text.UTF8Encoding $false))
+        Write-Host "  wrote $biPath" -ForegroundColor Green
+
+        # Emit variables for build.bat.
+        $vars = @"
+set "PAYLOAD_SHA256=$official"
+set "BINARY_SHA256=$binSha"
+set "BINARY_BYTES=$binLen"
+set "RELEASE_VERSION=$version"
+set "RELEASE_TAG=$tag"
+set "ASSET_NAME=$assetName"
+"@
+        [IO.File]::WriteAllText((Join-Path $WorkDir 'build.vars.bat'), $vars,
+                                (New-Object Text.UTF8Encoding $false))
+        break
+    }
+
+    'pack' {
+        if (Test-Path $Out) { Remove-Item $Out -Force }
+        $outDir = Split-Path $Out -Parent
+        if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
+        $fs = [IO.File]::Open($Out, 'Create', 'Write')
+        try {
+            $buf = New-Object byte[] (1MB)
+            foreach ($src in @($Stub, $Payload)) {
+                $in = [IO.File]::Open($src, 'Open', 'Read', 'Read')
+                try {
+                    while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) { $fs.Write($buf, 0, $n) }
+                } finally { $in.Close() }
+            }
+            $plen = (Get-Item $Payload).Length
+            $fs.Write([BitConverter]::GetBytes([int64]$plen), 0, 8)
+            $fs.Write($MagicBytes, 0, 16)
+        } finally { $fs.Close() }
+
+        $stubLen = (Get-Item $Stub).Length
+        $payLen  = (Get-Item $Payload).Length
+        $total   = (Get-Item $Out).Length
+        Write-Host ("  stub {0:N0} B + payload {1:N0} B + trailer 24 B = {2:N0} B" -f $stubLen, $payLen, $total)
+        if ($total -ne ($stubLen + $payLen + 24)) { throw "packed size mismatch" }
+        break
+    }
+
+    'verify' {
+        $total = (Get-Item $Out).Length
+        if ($total -le 24) { throw "output too small" }
+
+        $fs = [IO.File]::Open($Out, 'Open', 'Read', 'Read')
+        $len = 0; $magic = ''; $offset = 0
+        try {
+            $fs.Seek($total - 24, 'Begin') | Out-Null
+            $t = New-Object byte[] 24
+            $got = $fs.Read($t, 0, 24)
+            if ($got -ne 24) { throw "could not read trailer" }
+            $len = [BitConverter]::ToInt64($t, 0)
+            $magic = [Text.Encoding]::ASCII.GetString($t, 8, 16)
+            $offset = $total - 24 - $len
+        } finally { $fs.Close() }
+
+        if ($magic -ne $Magic) { throw "bad magic: '$magic'" }
+        if ($offset -le 0) { throw "bad payload offset: $offset" }
+        Write-Host ("  trailer OK: magic='{0}' offset={1:N0} length={2:N0}" -f $magic, $offset, $len)
+
+        $regionSha = Get-Sha256Region $Out $offset $len
+        Write-Host "  embedded payload SHA256: $regionSha"
+        if ($ExpectPayloadSha -and ($regionSha -ne $ExpectPayloadSha)) {
+            throw "embedded payload hash mismatch: expected $ExpectPayloadSha"
+        }
+        if ($ExpectPayloadSha) {
+            Write-Host "  embedded payload matches official SHA256" -ForegroundColor Green
+        }
+        Write-Output "VERIFIED"
+        break
+    }
+}
