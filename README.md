@@ -25,7 +25,7 @@ ClaudeCodeSetup.exe   约 95 MB
 
 ### 校验下载的文件
 
-安装包体积较大，建议先核对 SHA256 再运行。哈希值随 Release 说明一同公布：
+安装包体积较大，建议先核对 SHA256 再运行：
 
 ```powershell
 Get-FileHash .\ClaudeCodeSetup.exe -Algorithm SHA256
@@ -33,6 +33,12 @@ Get-FileHash .\ClaudeCodeSetup.exe -Algorithm SHA256
 
 ```cmd
 certutil -hashfile ClaudeCodeSetup.exe SHA256
+```
+
+当前发布件（v1.0.0，95.1 MB）：
+
+```
+e682ddb0d888768954ec49e57c861bd9d53874754e862bd5eeb6af4490dcd621
 ```
 
 安装器本身也会在启动时做两次自校验：先比对**内置载荷**的 SHA256 与官方
