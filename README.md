@@ -180,6 +180,30 @@ build\test.bat /full      :: 额外测试 ARM64 在线下载分支
 
 产物在 `dist\ClaudeCodeSetup.exe`。
 
+### 测试
+
+**单元测试（`build\unit.bat`）**：零依赖的 assert 式测试，源码在 `tests\UnitTests.cs`，
+用系统自带的 `csc.exe` 编译运行，不引入任何第三方测试框架。它覆盖
+`Common.cs` / `Checks.cs` / `Installer.cs` 里的纯逻辑（PATH 前置与查重、路径归一化、
+架构判定、载荷定位、子流读写、SHA256 等），并顺带对全部产品源码做一次编译检查。
+
+```cmd
+build\unit.bat            :: 全部通过退出码 0，任一断言失败退出码 1
+```
+
+**端到端测试（`build\e2e-with-backup.bat`）**：`build\test.bat` 会**真的安装并卸载**，
+而卸载路径当前会无条件删除用户级环境变量（见 `AUTOWORK.md` 的 AW-1）。因此不要直接
+跑 `build\test.bat`，而应通过带环境护栏的包装脚本：
+
+```cmd
+build\e2e-with-backup.bat         :: 先备份 HKCU\Environment，跑 E2E，再比对/必要时恢复
+build\e2e-with-backup.bat /full   :: 额外测试 ARM64 在线下载分支
+```
+
+包装脚本会先 `reg export` 备份 `HKCU\Environment`，跑完再导出一份做逐字节比对；
+若发现被改动就用备份 `reg import` 恢复并复验，最后把「环境是否被改动」作为结论行打印
+（`UNCHANGED` / `CHANGED-RESTORED` 等）。退出码透传 `build\test.bat` 的结果。
+
 > 构建脚本刻意保持纯 ASCII：cmd.exe 会破坏非 ASCII 批处理文件，Windows
 > PowerShell 5.1 也会误解无 BOM 的 UTF-8 脚本。中文只出现在 `.cs` 源文件中，
 > 由 `csc /codepage:65001` 处理。
@@ -201,7 +225,11 @@ build\test.bat /full      :: 额外测试 ARM64 在线下载分支
 │   ├── build.bat           构建主流程
 │   ├── build.ps1           哈希校验 / 打包 / 自检
 │   ├── fetch-payload.ps1   拉取官方载荷
-│   └── test.bat            端到端测试
+│   ├── test.bat            端到端测试（会真的安装/卸载）
+│   ├── e2e-with-backup.bat test.bat 的环境护栏包装（备份/比对/恢复 HKCU\Environment）
+│   └── unit.bat            零依赖 C# 单元测试（编译并运行 tests\UnitTests.cs）
+├── tests/
+│   └── UnitTests.cs        自研 assert 式单元测试
 └── payload/                官方载荷（不入版本库）
 ```
 
