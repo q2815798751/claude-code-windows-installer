@@ -55,6 +55,9 @@ namespace ClaudeCodeSetup
             string tmpZip = null;      // ARM64 下载路径的临时 zip
 
             bool touchedSystem = false;
+            // 记录本次安装是否真的写入了用户级 CLAUDE_CODE_GIT_BASH_PATH。
+            // 卸载时据此判断该变量是不是本安装器的“责任”，避免误删用户自有的设置（AW-1）。
+            bool gitBashEnvWritten = false;
             try
             {
                 // ── 步骤 1：准备目录 ────────────────────────────
@@ -171,6 +174,7 @@ namespace ClaudeCodeSetup
                 if (opt.SystemChanges && !string.IsNullOrEmpty(opt.GitBash))
                 {
                     SetUserEnv("CLAUDE_CODE_GIT_BASH_PATH", opt.GitBash, RegistryValueKind.String);
+                    gitBashEnvWritten = true;
                     Log.Write("CLAUDE_CODE_GIT_BASH_PATH = " + opt.GitBash);
                 }
 
@@ -199,7 +203,7 @@ namespace ClaudeCodeSetup
                 else Log.Write("（沙箱模式：跳过卸载注册表项）");
 
                 // ── 步骤 10：清单与日志 ─────────────────────────
-                WriteManifest(dir, opt, r);
+                WriteManifest(dir, opt, r, gitBashEnvWritten);
                 Log.Write("已写入 manifest.json");
 
                 Util.BroadcastEnvironmentChange();
@@ -379,16 +383,28 @@ namespace ClaudeCodeSetup
                 RemoveFromUserPath(dir);
                 Log.Write("已从用户 PATH 移除");
 
-                // 环境变量：仅当指向本安装目录时才移除
+                // 环境变量：仅当该变量由本安装器写入（或明确指向本次安装目录）时才移除。
+                // 用户装 Claude Code 之前自己配好的 Git Bash 路径不能被卸载顺手删掉（AW-1）。
+                // manifest 在下面删除安装目录之前读取。
                 try
                 {
                     string cur = Environment.GetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH",
                                                                     EnvironmentVariableTarget.User);
-                    if (!string.IsNullOrEmpty(cur))
+                    string recorded;
+                    bool wrote = ReadGitBashManifest(dir, out recorded);
+                    if (string.IsNullOrEmpty(cur))
+                    {
+                        // 变量不存在：无操作，不报错
+                    }
+                    else if (ShouldRemoveGitBashEnv(cur, wrote, recorded, dir))
                     {
                         Environment.SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH", null,
                                                            EnvironmentVariableTarget.User);
-                        Log.Write("已移除 CLAUDE_CODE_GIT_BASH_PATH");
+                        Log.Write("已移除本安装器写入的 CLAUDE_CODE_GIT_BASH_PATH");
+                    }
+                    else
+                    {
+                        Log.Write("保留用户自有的 CLAUDE_CODE_GIT_BASH_PATH: " + cur);
                     }
                 }
                 catch { }
@@ -771,7 +787,8 @@ namespace ClaudeCodeSetup
             }
         }
 
-        private static void WriteManifest(string dir, InstallOptions opt, InstallResult r)
+        private static void WriteManifest(string dir, InstallOptions opt, InstallResult r,
+                                          bool gitBashEnvWritten)
         {
             string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             StringBuilder sb = new StringBuilder();
@@ -789,7 +806,12 @@ namespace ClaudeCodeSetup
                 DateTime.Now.ToString("yyyy-MM-ddTHH:mm:sszzz", CultureInfo.InvariantCulture)).Append("\",\r\n");
             sb.Append("  \"installDir\": \"").Append(JsonEscape(dir)).Append("\",\r\n");
             sb.Append("  \"binaryBytes\": ").Append(r.InstalledBytes.ToString(CultureInfo.InvariantCulture)).Append(",\r\n");
-            sb.Append("  \"gitBashPath\": \"").Append(JsonEscape(opt.GitBash == null ? "" : opt.GitBash)).Append("\",\r\n");
+            // gitBashEnvWritten 表示“本安装器写入了用户级 CLAUDE_CODE_GIT_BASH_PATH”；
+            // gitBashPath 是当时写入的值。卸载器据此判断该变量是否由本安装器负责（AW-1）。
+            // 未写入时两者留空，老版本安装器产出的 manifest 没有 gitBashEnvWritten 字段。
+            sb.Append("  \"gitBashEnvWritten\": ").Append(gitBashEnvWritten ? "true" : "false").Append(",\r\n");
+            sb.Append("  \"gitBashPath\": \"").Append(
+                JsonEscape(gitBashEnvWritten && opt.GitBash != null ? opt.GitBash : "")).Append("\",\r\n");
             sb.Append("  \"userProfile\": \"").Append(JsonEscape(profile)).Append("\"\r\n");
             sb.Append("}\r\n");
             File.WriteAllText(Path.Combine(dir, "manifest.json"), sb.ToString(), new UTF8Encoding(false));
@@ -799,6 +821,91 @@ namespace ClaudeCodeSetup
         {
             if (string.IsNullOrEmpty(s)) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private static string JsonUnescape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("\\\"", "\"").Replace("\\\\", "\\");
+        }
+
+        // ── AW-1：卸载时该不该删用户级 CLAUDE_CODE_GIT_BASH_PATH ──────────
+
+        /// <summary>
+        /// 卸载时是否应移除用户级 CLAUDE_CODE_GIT_BASH_PATH。
+        /// 契约（兑现 Uninstall 里的注释）：仅当该变量确由本安装器写入、且用户此后没改过它，
+        /// 或者该值明确落在本次安装目录内（本安装器管理的 Git Bash）时才移除。
+        ///   - currentValue 为空 → 无操作（false）。
+        ///   - manifest 记录本安装器写过（manifestWroteIt）且当前值仍等于当时写入的值 → 移除。
+        ///   - 当前值位于 installDir 之下 → 移除。
+        ///   - 其余（用户在安装前自配、安装后改过、或老 manifest 无该记录）→ 保留。
+        /// </summary>
+        internal static bool ShouldRemoveGitBashEnv(string currentValue, bool manifestWroteIt,
+                                                    string recordedValue, string installDir)
+        {
+            if (string.IsNullOrEmpty(currentValue)) return false;
+
+            if (manifestWroteIt && !string.IsNullOrEmpty(recordedValue) &&
+                string.Equals(currentValue.Trim(), recordedValue.Trim(), StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            return PathIsUnder(currentValue, installDir);
+        }
+
+        /// <summary>path 是否就是 dir 本身或位于 dir 之下（大小写不敏感）。</summary>
+        internal static bool PathIsUnder(string path, string dir)
+        {
+            string p = Util.NormalizeDir(path);
+            string d = Util.NormalizeDir(dir);
+            if (p.Length == 0 || d.Length == 0) return false;
+            if (p == d) return true;
+            return p.StartsWith(d + "\\", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// 从安装目录的 manifest.json 读取“本安装器是否写入过 CLAUDE_CODE_GIT_BASH_PATH”
+        /// 及当时写入的值。返回值 true 表示 manifest 明确记录写过该变量；
+        /// recordedValue 为当时写入的值（无记录时为空串）。老 manifest 无该字段时返回 false，
+        /// 卸载器因此不会据它删除（向后兼容）。
+        /// </summary>
+        internal static bool ReadGitBashManifest(string dir, out string recordedValue)
+        {
+            recordedValue = "";
+            try
+            {
+                string path = Path.Combine(dir, "manifest.json");
+                if (!File.Exists(path)) return false;
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                if (!JsonBool(text, "gitBashEnvWritten")) return false;
+                recordedValue = JsonString(text, "gitBashPath");
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static string JsonString(string json, string key)
+        {
+            string needle = "\"" + key + "\"";
+            int i = json.IndexOf(needle, StringComparison.Ordinal);
+            if (i < 0) return "";
+            int c = json.IndexOf(':', i + needle.Length);
+            if (c < 0) return "";
+            int q1 = json.IndexOf('"', c + 1);
+            if (q1 < 0) return "";
+            int q2 = json.IndexOf('"', q1 + 1);
+            if (q2 < 0) return "";
+            return JsonUnescape(json.Substring(q1 + 1, q2 - q1 - 1));
+        }
+
+        private static bool JsonBool(string json, string key)
+        {
+            string needle = "\"" + key + "\"";
+            int i = json.IndexOf(needle, StringComparison.Ordinal);
+            if (i < 0) return false;
+            int c = json.IndexOf(':', i + needle.Length);
+            if (c < 0) return false;
+            string rest = json.Substring(c + 1).TrimStart();
+            return rest.StartsWith("true", StringComparison.OrdinalIgnoreCase);
         }
 
         // ── 进程执行 ────────────────────────────────────────────

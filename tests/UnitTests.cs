@@ -371,6 +371,106 @@ namespace ClaudeCodeSetup
                 "required free space constant is 700 MB");
         }
 
+        // ---- AW-1: InstallerCore.ShouldRemoveGitBashEnv -------------------
+
+        private static void Test_ShouldRemoveGitBashEnv_PointsElsewhere()
+        {
+            // The bug: a Git Bash path the user configured *before* installing must
+            // survive uninstall. It is neither recorded in the manifest nor inside
+            // the install dir, so it must be kept.
+            Check(!InstallerCore.ShouldRemoveGitBashEnv(
+                    "E:\\Git\\bin\\bash.exe", false, "", "C:\\Users\\me\\AppData\\Local\\ClaudeCode"),
+                "user-owned value outside the install dir is kept");
+            Check(!InstallerCore.ShouldRemoveGitBashEnv(
+                    "D:\\Tools\\PortableGit\\usr\\bin\\bash.exe", false, "", "C:\\CC"),
+                "another unrelated user path is kept");
+        }
+
+        private static void Test_ShouldRemoveGitBashEnv_PointsIntoInstallDir()
+        {
+            Check(InstallerCore.ShouldRemoveGitBashEnv(
+                    "C:\\CC\\git\\bin\\bash.exe", false, "", "C:\\CC"),
+                "value under the install dir is removed");
+            Check(InstallerCore.ShouldRemoveGitBashEnv(
+                    "C:\\CC", false, "", "C:\\CC\\"),
+                "value equal to the install dir (trailing slash) is removed");
+            Check(!InstallerCore.ShouldRemoveGitBashEnv(
+                    "C:\\CCX\\bin\\bash.exe", false, "", "C:\\CC"),
+                "a sibling dir sharing a name prefix must not match");
+        }
+
+        private static void Test_ShouldRemoveGitBashEnv_Absent()
+        {
+            Check(!InstallerCore.ShouldRemoveGitBashEnv(null, true, "C:\\CC\\bin\\bash.exe", "C:\\CC"),
+                "null value -> no operation");
+            Check(!InstallerCore.ShouldRemoveGitBashEnv("", true, "C:\\CC\\bin\\bash.exe", "C:\\CC"),
+                "empty value -> no operation");
+        }
+
+        private static void Test_ShouldRemoveGitBashEnv_ManifestOwnership()
+        {
+            // Installer wrote it and the user never changed it -> remove.
+            Check(InstallerCore.ShouldRemoveGitBashEnv(
+                    "C:\\Git\\bin\\bash.exe", true, "C:\\Git\\bin\\bash.exe", "C:\\CC"),
+                "value still equal to the manifest record is removed");
+            // Installer wrote it, but the user changed it afterwards -> keep.
+            Check(!InstallerCore.ShouldRemoveGitBashEnv(
+                    "D:\\Other\\bash.exe", true, "C:\\Git\\bin\\bash.exe", "C:\\CC"),
+                "value changed since install is kept");
+            // Old manifest without the field -> no ownership record -> keep.
+            Check(!InstallerCore.ShouldRemoveGitBashEnv(
+                    "C:\\Git\\bin\\bash.exe", false, "", "C:\\CC"),
+                "old manifest without the field does not authorise removal");
+        }
+
+        private static void Test_PathIsUnder()
+        {
+            Check(InstallerCore.PathIsUnder("C:\\CC\\a\\b.exe", "C:\\CC"), "nested file is under dir");
+            Check(InstallerCore.PathIsUnder("C:\\CC", "C:\\CC\\"), "dir equals itself");
+            Check(InstallerCore.PathIsUnder("c:\\cc\\x", "C:\\CC"), "comparison is case-insensitive");
+            Check(!InstallerCore.PathIsUnder("C:\\CCX\\y", "C:\\CC"), "prefix-only sibling is not under");
+            Check(!InstallerCore.PathIsUnder("", "C:\\CC"), "empty path is not under anything");
+            Check(!InstallerCore.PathIsUnder("C:\\CC\\a", ""), "empty dir matches nothing");
+        }
+
+        private static void Test_ReadGitBashManifest()
+        {
+            string d = TempDir();
+            try
+            {
+                string rec;
+
+                // New manifest: installer explicitly recorded that it wrote the var.
+                File.WriteAllText(Path.Combine(d, "manifest.json"),
+                    "{\r\n  \"product\": \"Claude Code\",\r\n  \"gitBashEnvWritten\": true,\r\n" +
+                    "  \"gitBashPath\": \"C:\\\\Git\\\\bin\\\\bash.exe\"\r\n}\r\n",
+                    new UTF8Encoding(false));
+                bool wrote = InstallerCore.ReadGitBashManifest(d, out rec);
+                Check(wrote, "written flag is read from the manifest");
+                Eq("C:\\Git\\bin\\bash.exe", rec, "backslash-escaped path is unescaped");
+
+                // Legacy manifest: no gitBashEnvWritten field -> not our responsibility.
+                File.WriteAllText(Path.Combine(d, "manifest.json"),
+                    "{\r\n  \"product\": \"Claude Code\",\r\n" +
+                    "  \"gitBashPath\": \"C:\\\\Git\\\\bin\\\\bash.exe\"\r\n}\r\n",
+                    new UTF8Encoding(false));
+                wrote = InstallerCore.ReadGitBashManifest(d, out rec);
+                Check(!wrote, "legacy manifest without the field reads as not-written");
+
+                // Explicit false.
+                File.WriteAllText(Path.Combine(d, "manifest.json"),
+                    "{\r\n  \"gitBashEnvWritten\": false,\r\n  \"gitBashPath\": \"\"\r\n}\r\n",
+                    new UTF8Encoding(false));
+                wrote = InstallerCore.ReadGitBashManifest(d, out rec);
+                Check(!wrote, "gitBashEnvWritten:false reads as not-written");
+
+                // Missing file must not throw.
+                wrote = InstallerCore.ReadGitBashManifest(Path.Combine(d, "nope.json"), out rec);
+                Check(!wrote, "missing manifest reads as not-written");
+            }
+            finally { RmTree(d); }
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -409,6 +509,13 @@ namespace ClaudeCodeSetup
             Run("Sha256File_Known", Test_Sha256File_Known);
 
             Run("Const_RequiredFreeBytes", Test_Const_RequiredFreeBytes);
+
+            Run("ShouldRemoveGitBashEnv_PointsElsewhere", Test_ShouldRemoveGitBashEnv_PointsElsewhere);
+            Run("ShouldRemoveGitBashEnv_PointsIntoInstallDir", Test_ShouldRemoveGitBashEnv_PointsIntoInstallDir);
+            Run("ShouldRemoveGitBashEnv_Absent", Test_ShouldRemoveGitBashEnv_Absent);
+            Run("ShouldRemoveGitBashEnv_ManifestOwnership", Test_ShouldRemoveGitBashEnv_ManifestOwnership);
+            Run("PathIsUnder", Test_PathIsUnder);
+            Run("ReadGitBashManifest", Test_ReadGitBashManifest);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);
