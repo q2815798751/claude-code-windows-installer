@@ -108,7 +108,7 @@
         `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 完好。
       - README 新增「测试」一节 + 目录结构补 `tests/`、`unit.bat`、`e2e-with-backup.bat`。
 
-- [ ] **AW-1 修卸载误删用户环境变量（最高优先级，破坏用户环境）**
+- [x] **AW-1 修卸载误删用户环境变量（最高优先级，破坏用户环境）**
       问题：`src\Installer.cs:382` 注释写「仅当指向本安装目录时才移除」，
       但 `src\Installer.cs:385-392` 只判断 `!string.IsNullOrEmpty(cur)`，
       **随即无条件删除**用户级 `CLAUDE_CODE_GIT_BASH_PATH`。
@@ -120,6 +120,34 @@
       **选哪种要写清理由**，并保证向后兼容（老 manifest 没有这个字段时不要乱删）。
       新增用例：变量指向别处 → 断言**不删**；变量指向安装目录 → 断言删；
       变量不存在 → 断言无操作不报错。
+      **结果（2026-10-17）**：完成（commit e5fe923）。
+      - **契约**：卸载时仅当该变量确由本安装器写入（安装时把 `gitBashEnvWritten=true` 与
+        写入值 `gitBashPath` 记进 `manifest.json`）、**且当前值仍等于当时写入的值**时才删；
+        另外若当前值落在本次安装目录内也删。其余（用户装前自配、安装后被改过、
+        或老 manifest 无该字段）**一律保留**。
+      - **选 manifest 记账法的理由**：真实 Git Bash 位于安装目录**之外**（如 `E:\Git\bin\bash.exe`），
+        纯「路径是否在安装目录下」的比对几乎永远不命中，无法判断归属；manifest 记账精确，
+        且向后兼容（老 manifest 没有 `gitBashEnvWritten` 字段 → `ReadGitBashManifest` 返回 false
+        → 不据此删除）。路径规则只作兜底。
+      - **实现**（`src\Installer.cs`，C# 5）：安装路径加 `gitBashEnvWritten` 标记；`WriteManifest`
+        新增 `gitBashEnvWritten` 字段、`gitBashPath` 仅在写入时记录；卸载路径用
+        `ReadGitBashManifest` 读清单 + 纯函数 `ShouldRemoveGitBashEnv`/`PathIsUnder` 判定，
+        删/留都记日志。清单在删除安装目录**之前**读取。
+      - **单测**：新增 6 个用例 / 21 个断言（`ShouldRemoveGitBashEnv` 三态 + manifest 归属三态、
+        `PathIsUnder`、`ReadGitBashManifest` 读写含老 manifest/缺失文件）。
+        `build\unit.bat` **29 用例 / 68 断言全绿，退出码 0**（AW-0 为 23/47）。
+      - **测试有效性**：把 `ShouldRemoveGitBashEnv` 临时改回旧的无条件删除逻辑，
+        `git diff` 确认回退**确实生效**后重跑 → **5 个断言变红、退出码 1**；改回后再
+        `git diff` 确认该改动已消失、重跑 **68/68 全绿**（先确认回退生效再取信）。
+      - **E2E 注入验证（新契约）**：`reg export` 备份 `HKCU\Environment` → 注入哨兵
+        `CLAUDE_CODE_GIT_BASH_PATH=C:\aw1-sentinel\bin\bash.exe` → 重编译 `dist`（含修复）→
+        `build\e2e-with-backup.bat` 跑沙箱装/卸：**E2E PASS，卸载后哨兵仍在**（新契约：不删），
+        脚本报 **`HKCU\Environment: UNCHANGED`**；沙箱 manifest 为 `gitBashEnvWritten:false`（正确）。
+        手工删哨兵后与**注入前**备份逐字节 `cmp` **IDENTICAL**，
+        `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 完好。
+      - **已知局限（未处理，见「待确认」）**：若用户安装前已自配该变量、安装器把它覆盖为探测到的
+        路径，则 manifest 记为「本安装器写入」，卸载按契约删除 → 用户原值丢失。是否要
+        「记录并在卸载时还原用户原值」属产品决策。
 
 - [ ] **AW-2 修「用新 PATH 启动」的假验证（正确性 + 验证有效性）**
       问题：`src\Installer.cs:283-296` 第 286 行把安装目录并入 PATH，
@@ -243,6 +271,8 @@
   32 位系统（例如用户环境里真有 32 位机器），应改为「警告 + 允许继续」。
 - **卸载时那个环境变量到底该不该删？** AW-1 按「只在由本安装器写入时才删」实现
   （兑现代码注释的契约）。如果你其实想要「卸载就删干净」，那是另一个契约，说一声。
+  另：若用户**安装前**已自配该变量、被安装器覆盖，卸载会按契约删除（用户原值丢失）。
+  要不要改成「安装时记录用户原值、卸载时还原」？属产品决策，等拍板。
 - **38 处空 catch 要不要全面加日志？** AW-11 只做了安装/卸载主链路。
 - **要不要把 E2E 加进 CI？** AW-12 明确没加，理由是写盘量与网络依赖。
 - **`docs/PLAN.md` 是活文档还是历史存档？** 如果它只是「当时的计划」，AW-8 可能不该改它，
