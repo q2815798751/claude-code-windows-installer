@@ -70,7 +70,7 @@
 
 ## 当前进度
 
-- [ ] **AW-0 建验证基建（可验证性 + 环境安全）** —— 后面所有条目的前提，必须第一个做。
+- [x] **AW-0 建验证基建（可验证性 + 环境安全）** —— 后面所有条目的前提，必须第一个做。
       两件事：
       (a) **C# 单元测试基建**：`tests\` 目录 + 一个 assert 式测试程序（纯 C# 5，零依赖），
       用系统 `csc.exe` 编译运行，入口 `build\unit.bat`，失败时**非零退出码**。
@@ -85,6 +85,28 @@
       顺手在 `README.md` 加一节说明 `build\unit.bat` 和 `build\e2e-with-backup.bat` 怎么用。
       完成标准：`build\unit.bat` 全绿；备份脚本能在一次真实 `build\test.bat` 运行中
       正确检出并报告环境变化。验证后把用例数记到本条目末尾。
+      **结果（2026-10-17）**：完成。
+      - (a) `tests\UnitTests.cs` + `build\unit.bat`：**23 个用例 / 47 个断言，全绿，退出码 0**。
+        用系统 `csc.exe` 一次编译全部产品源码（`Program.cs`/`Uninstaller.cs`/测试类各有
+        `Main`，用 `/main:ClaudeCodeSetup.UnitTests` 指定入口；GUI 程序集加
+        `/r:System.Windows.Forms.dll`），因此 unit.bat 同时是一次全项目编译检查。
+        覆盖 `Util.NormalizeDir/PathContains/PrependPath`、`InstallerCore.FirstToken`、
+        `Util.NativeArch`（进程内注入环境变量，用完即还原）、`NetProbe.Score/Summary`、
+        `Payload.Locate`（含合法/无魔术字/过短三种）、`SubStream` 读写寻址、
+        `Util.Sha256File`、`Const.RequiredFreeBytes`。`src\BuildInfo.cs` 缺失时自动生成
+        占位 stub，保证新克隆/CI 也能跑。
+      - 测试有效性：故意把 `Util.PrependPath` 的 `dir + ";" + trimmed` 改成
+        `trimmed + ";" + dir`，`git diff` 确认改动确实存在后重跑 → **2 个用例变红、退出码 1**；
+        改回后 `git diff` 为空、再跑 **47/47 全绿**（先确认回退生效再取信）。
+      - (b) `build\e2e-with-backup.bat`：`reg export` 备份 → 跑 `build\test.bat` →
+        再导出并逐字节 `fc /b` 比对 → 变了就 `reg import` 恢复并复验 → 打印
+        `UNCHANGED`/`CHANGED-RESTORED` 等结论；退出码透传 test.bat。
+        两次真实 E2E 验证：① 不注入时 **E2E PASS、`HKCU\Environment: UNCHANGED`**；
+        ② 注入哨兵 `CLAUDE_CODE_GIT_BASH_PATH` 后跑，卸载阶段把它删了（AW-1 的现象），
+        脚本 **检出改动并 `reg import` 恢复、复验通过 → `CHANGED-RESTORED`**。
+        收尾：手工删掉哨兵后与注入前的备份逐字节比对 **IDENTICAL**，
+        `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 完好。
+      - README 新增「测试」一节 + 目录结构补 `tests/`、`unit.bat`、`e2e-with-backup.bat`。
 
 - [ ] **AW-1 修卸载误删用户环境变量（最高优先级，破坏用户环境）**
       问题：`src\Installer.cs:382` 注释写「仅当指向本安装目录时才移除」，
