@@ -600,6 +600,35 @@ namespace ClaudeCodeSetup
             finally { RmTree(root); }
         }
 
+        // ---- AW-3: Preflight.ExistingAdvice wording matches implementation ----
+        //
+        // CheckExisting() probes the real filesystem/PATH, so it cannot be driven
+        // deterministically from a unit test. The user-visible advice text was
+        // therefore extracted into the pure helper Preflight.ExistingAdvice so the
+        // exact wording can be asserted here (AW-0 review flagged Checks.cs as
+        // having zero coverage).
+        //
+        // The installer prepends the install dir to the user PATH
+        // (Installer.AddToUserPath -> Util.PrependPath), so the advice must say the
+        // dir is placed at the FRONT. The Chinese literals are written as \u escapes
+        // to keep this file ASCII-only (per the file header).
+        private static void Test_CheckExisting_AdviceSaysPrepend()
+        {
+            string dir = "C:\\AW3FakeInstall";
+            string advice = Preflight.ExistingAdvice(dir);
+
+            // Written as \u escapes so this file stays ASCII-only (see header).
+            string prepend = "\u524d\u7f6e"; // = "prepended" (front of PATH)
+            string append  = "\u672b\u5c3e"; // = "at the end" (tail of PATH)
+
+            Check(advice != null && advice.IndexOf(prepend, StringComparison.Ordinal) >= 0,
+                  "advice says the install dir is PREPENDED to PATH");
+            Check(advice != null && advice.IndexOf(append, StringComparison.Ordinal) < 0,
+                  "advice does NOT say the install dir goes at the END of PATH");
+            Check(advice != null && advice.IndexOf(dir, StringComparison.Ordinal) >= 0,
+                  "advice mentions the install dir");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -649,6 +678,8 @@ namespace ClaudeCodeSetup
             Run("VerifyLaunchViaPath_UsesBareNameOnPath", Test_VerifyLaunchViaPath_UsesBareNameOnPath);
             Run("VerifyLaunchViaPath_ReportsFailure", Test_VerifyLaunchViaPath_ReportsFailure);
             Run("RunViaPath_ResolvesThroughPath", Test_RunViaPath_ResolvesThroughPath);
+
+            Run("CheckExisting_AdviceSaysPrepend", Test_CheckExisting_AdviceSaysPrepend);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);

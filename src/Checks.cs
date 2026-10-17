@@ -422,9 +422,18 @@ namespace ClaudeCodeSetup
 
             c.State = CheckState.Warn;
             c.Detail = found;
-            c.Advice = "检测到已有 Claude Code。继续安装将把原生版本装到 " + dir + " 并置入 PATH 末尾，"
-                     + "不会删除原有安装。如需避免冲突，可先卸载旧版本。";
+            c.Advice = ExistingAdvice(dir);
             return c;
+        }
+
+        // 已有安装时的用户可见提示文案。抽成纯函数以便单测直接断言措辞：
+        // CheckExisting 本身要探测文件系统/PATH，无法在单测里确定性地驱动。
+        // 文案必须与实现一致——安装时用 Util.PrependPath 把安装目录**前置**进
+        // 用户 PATH（见 Installer.AddToUserPath），所以这里写「前置」而非「末尾」。
+        internal static string ExistingAdvice(string dir)
+        {
+            return "检测到已有 Claude Code。继续安装将把原生版本装到 " + dir + " 并置入 PATH 前置，"
+                 + "不会删除原有安装。如需避免冲突，可先卸载旧版本。";
         }
 
         // ── 8. 进程占用 ──────────────────────────────────────────
