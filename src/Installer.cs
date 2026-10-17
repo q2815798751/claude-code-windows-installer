@@ -45,6 +45,30 @@ namespace ClaudeCodeSetup
     internal delegate int PathRunner(string command, string args, string workDir,
                                      int timeoutMs, string pathOverride, out string output);
 
+    /// <summary>
+    /// AW-6：文件系统操作的窄接口。抽出它是为了让「落盘失败」「覆盖安装回滚」这类
+    /// **只在异常路径上发生**的分支能在单测里确定性地驱动——注入一个会让 MoveFile
+    /// 抛异常的假实现即可，不必真的制造磁盘故障。生产代码用 RealFileOps。
+    /// </summary>
+    internal interface IFileOps
+    {
+        bool FileExists(string path);
+        bool DirExists(string path);
+        void MoveFile(string src, string dst);
+        void DeleteFile(string path);
+        void DeleteDir(string path);
+    }
+
+    /// <summary>IFileOps 的真实实现（直接转发到 System.IO）。</summary>
+    internal sealed class RealFileOps : IFileOps
+    {
+        public bool FileExists(string path) { return File.Exists(path); }
+        public bool DirExists(string path) { return Directory.Exists(path); }
+        public void MoveFile(string src, string dst) { File.Move(src, dst); }
+        public void DeleteFile(string path) { File.Delete(path); }
+        public void DeleteDir(string path) { Directory.Delete(path, true); }
+    }
+
     internal static class InstallerCore
     {
         internal const string PayloadEntry = "claude.exe";
@@ -64,6 +88,10 @@ namespace ClaudeCodeSetup
             string tmpZip = null;      // ARM64 下载路径的临时 zip
 
             bool touchedSystem = false;
+            // AW-6(b)：本次是不是「覆盖/修复安装」——必须在任何安装动作**之前**、按安装前的
+            // 文件系统状态判定，并一直传到回滚点。覆盖安装中途失败时不能整体删除安装目录
+            // （那是用户原有的安装），只能回滚到备份状态。
+            bool wasOverwrite = IsOverwriteInstall(dir, new RealFileOps());
             // 记录本次安装是否真的写入了用户级 CLAUDE_CODE_GIT_BASH_PATH。
             // 卸载时据此判断该变量是不是本安装器的“责任”，避免误删用户自有的设置（AW-1）。
             bool gitBashEnvWritten = false;
@@ -141,12 +169,13 @@ namespace ClaudeCodeSetup
                     throw new InvalidOperationException("二进制在写入过程中发生变化，安装中止。");
 
                 // ── 步骤 4：原子落盘 ────────────────────────────
+                // AW-6(a)：先把已存在的旧 claude.exe 改名备份为 claude.exe.old，再把新产物
+                // Move 到位。旧实现先 SafeDelete(exePath) 再 File.Move，Move 一失败用户原有的
+                // claude.exe 就已经没了——并不“原子”。备份保留到安装整体成功后才提交删除，
+                // 因此中途失败时回滚可以还原它（AW-6b）。
                 if (File.Exists(exePath))
-                {
-                    Log.Write("已存在旧 claude.exe，将被覆盖");
-                    SafeDelete(exePath);
-                }
-                File.Move(tmpPath, exePath);
+                    Log.Write("已存在旧 claude.exe，将备份为 claude.exe.old 后覆盖");
+                AtomicPlace(exePath, tmpPath, new RealFileOps());
                 r.InstalledBytes = extracted;
                 Log.Write("已写入 " + exePath);
 
@@ -228,6 +257,8 @@ namespace ClaudeCodeSetup
                 catch { }
 
                 r.Ok = true;
+                // AW-6：安装整体成功，提交事务——删除 claude.exe.old 备份。
+                CommitBackup(exePath, new RealFileOps());
                 Report(progress, log, 96, "安装完成，开始完整性验证…");
             }
             catch (Exception ex)
@@ -239,7 +270,15 @@ namespace ClaudeCodeSetup
                 if (touchedSystem)
                 {
                     Log.Write("回滚已写入的系统改动…");
-                    try { Rollback(opt); } catch (Exception rex) { Log.Write("回滚异常: " + rex.Message); }
+                    try { Rollback(opt, wasOverwrite); } catch (Exception rex) { Log.Write("回滚异常: " + rex.Message); }
+                }
+                else if (wasOverwrite)
+                {
+                    // AW-6：尚未写系统改动，但步骤 4 可能已产生 claude.exe.old 备份（例如
+                    // 步骤 5 冒烟测试失败）。还原它，让覆盖安装失败后用户的 claude.exe 回到
+                    // 安装前的版本，并避免留下 .old 残留。仅覆盖安装才需要（全新安装没有备份）。
+                    try { RestoreOverwriteBackup(exePath, new RealFileOps()); }
+                    catch (Exception rex) { Log.Write("还原备份异常: " + rex.Message); }
                 }
             }
             finally
@@ -557,16 +596,114 @@ namespace ClaudeCodeSetup
             return false;
         }
 
-        private static void Rollback(InstallOptions opt)
+        // ─────────────────────────────────────────────────────────
+        // AW-6：原子落盘 / 回滚（覆盖安装不误删既有安装）
+        // ─────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// AW-6(b)：判断本次安装是否为「覆盖/修复安装」——安装开始前目标目录是否已有
+        /// 既有的安装（claude.exe 或 manifest.json）。必须在任何安装动作之前、按安装前的
+        /// 文件系统状态判定。返回 true 表示目录里已有用户的既有安装，回滚时不能整体删除。
+        /// </summary>
+        internal static bool IsOverwriteInstall(string dir, IFileOps fs)
+        {
+            if (fs.FileExists(Path.Combine(dir, "claude.exe"))) return true;
+            if (fs.FileExists(Path.Combine(dir, "manifest.json"))) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// AW-6(a)：原子落盘。先把已存在的旧 claude.exe 改名备份为 &lt;exe&gt;.old，再把新产物
+        /// Move 到位；Move 失败时把 .old 改回原名，用户原有的 claude.exe 保持原样。
+        /// 备份**不在此处删除**：它保留到安装整体成功（CommitBackup）或由回滚
+        /// （RollbackDir / RestoreOverwriteBackup）还原，作为覆盖安装的事务回滚点（AW-6b）。
+        /// 落盘成功返回 true；失败时抛出异常（此时旧 exe 已还原）。
+        /// </summary>
+        internal static bool AtomicPlace(string exePath, string tmpPath, IFileOps fs)
+        {
+            string oldPath = exePath + ".old";
+            bool hadOld = fs.FileExists(exePath);
+            if (hadOld)
+            {
+                // 清掉上一轮可能残留的备份，避免 Move 因目标已存在而失败。
+                try { if (fs.FileExists(oldPath)) fs.DeleteFile(oldPath); } catch { }
+                fs.MoveFile(exePath, oldPath);
+            }
+            try
+            {
+                fs.MoveFile(tmpPath, exePath);
+            }
+            catch
+            {
+                // 落盘失败：把备份改回原名，恢复用户原有的 claude.exe，再向上抛。
+                if (hadOld)
+                {
+                    try { fs.MoveFile(oldPath, exePath); } catch { }
+                }
+                throw;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// AW-6(a)：安装整体成功后提交事务——删除 claude.exe.old 备份。best-effort，
+        /// 删除失败不影响安装结果（残留的 .old 只是多余文件，不影响 claude.exe）。
+        /// </summary>
+        internal static void CommitBackup(string exePath, IFileOps fs)
+        {
+            try
+            {
+                string oldPath = exePath + ".old";
+                if (fs.FileExists(oldPath)) fs.DeleteFile(oldPath);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// AW-6：把 claude.exe.old 备份还原回 claude.exe（撤销本次覆盖）。若没有备份
+        /// （全新安装，或落盘本身就已回滚）则为无操作。best-effort，绝不抛出。
+        /// </summary>
+        internal static void RestoreOverwriteBackup(string exePath, IFileOps fs)
+        {
+            string oldPath = exePath + ".old";
+            if (!fs.FileExists(oldPath)) return;
+            try { if (fs.FileExists(exePath)) fs.DeleteFile(exePath); } catch { }
+            try { fs.MoveFile(oldPath, exePath); } catch { }
+        }
+
+        /// <summary>
+        /// AW-6(b)：把安装目录回滚到安装前的状态。
+        /// 契约：
+        ///   - 全新安装（wasOverwrite == false）：删除安装目录——它是本安装器本次创建的。
+        ///   - 覆盖/修复安装（wasOverwrite == true）：**绝不整体删除**用户原有的安装目录
+        ///     （旧实现无条件 Directory.Delete(dir, true)，会把用户原有安装一并删掉）。
+        ///     若有 claude.exe.old 备份则还原回 claude.exe（撤销本次覆盖），否则原样保留。
+        /// 返回 true 表示删除了目录（全新安装），false 表示保留了既有安装。
+        /// </summary>
+        internal static bool RollbackDir(string dir, string exePath, bool wasOverwrite, IFileOps fs)
+        {
+            if (wasOverwrite)
+            {
+                RestoreOverwriteBackup(exePath, fs);
+                return false;
+            }
+            try { if (fs.DirExists(dir)) fs.DeleteDir(dir); } catch { }
+            return true;
+        }
+
+        private static void Rollback(InstallOptions opt, bool wasOverwrite)
         {
             string dir = opt.InstallDir;
+            string exePath = Path.Combine(dir, "claude.exe");
             try { RemoveFromUserPath(dir); } catch { }
             try { DeleteIfExists(Path.Combine(Util.DesktopDir(), Const.ProductName + ".lnk")); } catch { }
             try { DeleteIfExists(Path.Combine(Util.StartMenuDir(), Const.ProductName + ".lnk")); } catch { }
             try { Registry.CurrentUser.DeleteSubKeyTree(Const.RegUninstall, false); } catch { }
-            try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+            bool dirDeleted = false;
+            try { dirDeleted = RollbackDir(dir, exePath, wasOverwrite, new RealFileOps()); } catch { }
+            if (dirDeleted) Log.Write("回滚完成：已删除本次创建的安装目录");
+            else Log.Write("回滚完成：保留既有安装（覆盖安装，未删除目录；已还原备份）");
             try { Util.BroadcastEnvironmentChange(); } catch { }
-            Log.Write("回滚完成");
         }
 
         // ─────────────────────────────────────────────────────────

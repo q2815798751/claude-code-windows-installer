@@ -101,6 +101,40 @@ namespace ClaudeCodeSetup
             catch { }
         }
 
+        // ---- AW-6: in-memory IFileOps so the failure paths can be driven ----
+        //
+        // AtomicPlace/RollbackDir only misbehave on the exception path (a failed
+        // File.Move, a mid-install failure). Driving those deterministically would
+        // mean inducing real disk failures; instead this fake filesystem lets a
+        // test make a chosen Move throw, or set up the exact mid-failure state.
+        private sealed class FakeFileOps : IFileOps
+        {
+            internal readonly Dictionary<string, string> Files =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            internal readonly Dictionary<string, bool> Dirs =
+                new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            // When a MoveFile's source equals FailMoveSrc, throw (simulate the
+            // placement Move failing, e.g. the target being locked).
+            internal string FailMoveSrc;
+
+            public bool FileExists(string path) { return Files.ContainsKey(path); }
+            public bool DirExists(string path) { return Dirs.ContainsKey(path); }
+
+            public void MoveFile(string src, string dst)
+            {
+                if (FailMoveSrc != null &&
+                    string.Equals(src, FailMoveSrc, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("simulated move failure: " + src);
+                if (!Files.ContainsKey(src))
+                    throw new FileNotFoundException("no such file: " + src);
+                Files[dst] = Files[src];
+                Files.Remove(src);
+            }
+
+            public void DeleteFile(string path) { Files.Remove(path); }
+            public void DeleteDir(string path) { Dirs.Remove(path); }
+        }
+
         // ---------------------------------------------------------------- tests
 
         // ---- Util.NormalizeDir --------------------------------------------
@@ -754,6 +788,123 @@ namespace ClaudeCodeSetup
             EqInt(0, self.Count, "selftest switch is recognised");
         }
 
+        // ---- AW-6: InstallerCore.AtomicPlace / RollbackDir -----------------
+        //
+        // (a) The old "atomic" write was not atomic: it did SafeDelete(exePath)
+        //     and only then File.Move(tmp, exe). If that Move failed the user's
+        //     claude.exe was already gone. The fix backs the old exe up to
+        //     claude.exe.old first and restores it if the placement Move fails.
+        // (b) Rollback used to Directory.Delete(dir, true) unconditionally, so a
+        //     failed overwrite/repair install wiped the user's existing install.
+        //     The fix keeps the dir and restores the backup instead.
+        private static void Test_AtomicPlace_MoveFails_OldExeKept()
+        {
+            string dir = "C:\\CC";
+            string exe = dir + "\\claude.exe";
+            string tmp = dir + "\\claude.exe.tmp";
+
+            FakeFileOps fs = new FakeFileOps();
+            fs.Files[exe] = "OLD-BINARY";
+            fs.Files[tmp] = "NEW-BINARY";
+            fs.FailMoveSrc = tmp; // the placement Move (tmp -> exe) fails
+
+            bool threw = false;
+            try { InstallerCore.AtomicPlace(exe, tmp, fs); }
+            catch { threw = true; }
+
+            Check(threw, "AtomicPlace propagates the placement failure");
+            Check(fs.FileExists(exe),
+                  "the old claude.exe is still present after a failed placement");
+            Eq("OLD-BINARY", fs.Files[exe],
+               "the old claude.exe content is intact (the new binary was not left half-written)");
+            Check(fs.FileExists(tmp),
+                  "the extracted tmp file is left for the caller to clean up");
+            Check(!fs.FileExists(exe + ".old"),
+                  "the .old backup is rolled back, no leftover");
+        }
+
+        private static void Test_AtomicPlace_Success_KeepsBackupUntilCommit()
+        {
+            string dir = "C:\\CC";
+            string exe = dir + "\\claude.exe";
+            string tmp = dir + "\\claude.exe.tmp";
+
+            FakeFileOps fs = new FakeFileOps();
+            fs.Files[exe] = "OLD-BINARY";
+            fs.Files[tmp] = "NEW-BINARY";
+
+            InstallerCore.AtomicPlace(exe, tmp, fs);
+            Eq("NEW-BINARY", fs.Files[exe], "the new binary is placed");
+            Check(fs.FileExists(exe + ".old"),
+                  "the backup is kept after placement (transaction rollback point)");
+            Eq("OLD-BINARY", fs.Files[exe + ".old"],
+               "the backup holds the previous binary");
+
+            InstallerCore.CommitBackup(exe, fs);
+            Check(!fs.FileExists(exe + ".old"), "the backup is removed once the install commits");
+            Eq("NEW-BINARY", fs.Files[exe], "the committed exe is still the new binary");
+        }
+
+        private static void Test_Rollback_OverwriteKeepsExistingInstall()
+        {
+            string dir = "C:\\CC";
+            string exe = dir + "\\claude.exe";
+
+            FakeFileOps fs = new FakeFileOps();
+            fs.Dirs[dir] = true;
+            fs.Files[exe] = "NEW-BINARY";        // new binary already placed mid-install
+            fs.Files[exe + ".old"] = "USER-OLD"; // backup of the user's pre-existing install
+
+            bool deleted = InstallerCore.RollbackDir(dir, exe, true, fs);
+
+            Check(!deleted, "overwrite rollback does NOT delete the install dir");
+            Check(fs.DirExists(dir), "the user's pre-existing install dir survives");
+            Eq("USER-OLD", fs.Files[exe],
+               "the user's original claude.exe is restored from the backup");
+            Check(!fs.FileExists(exe + ".old"), "the backup is consumed by the restore");
+
+            // Overwrite install that failed before the binary was ever placed: no
+            // backup exists yet, but the dir must still be left alone.
+            FakeFileOps fs2 = new FakeFileOps();
+            fs2.Dirs[dir] = true;
+            fs2.Files[exe] = "USER-ORIGINAL";
+            bool deleted2 = InstallerCore.RollbackDir(dir, exe, true, fs2);
+            Check(!deleted2 && fs2.DirExists(dir),
+                  "overwrite rollback with no backup still keeps the dir");
+            Eq("USER-ORIGINAL", fs2.Files[exe], "the untouched exe is left as-is");
+        }
+
+        private static void Test_Rollback_FreshInstallDeletesDir()
+        {
+            string dir = "C:\\CC";
+            string exe = dir + "\\claude.exe";
+
+            FakeFileOps fs = new FakeFileOps();
+            fs.Dirs[dir] = true;
+            fs.Files[exe] = "PARTIAL";
+
+            bool deleted = InstallerCore.RollbackDir(dir, exe, false, fs);
+            Check(deleted, "fresh-install rollback deletes the dir it created");
+            Check(!fs.DirExists(dir), "the freshly created dir is removed");
+        }
+
+        private static void Test_IsOverwriteInstall()
+        {
+            FakeFileOps empty = new FakeFileOps();
+            Check(!InstallerCore.IsOverwriteInstall("C:\\CC", empty),
+                  "an empty/absent dir is not an overwrite install");
+
+            FakeFileOps withExe = new FakeFileOps();
+            withExe.Files["C:\\CC\\claude.exe"] = "x";
+            Check(InstallerCore.IsOverwriteInstall("C:\\CC", withExe),
+                  "a dir containing claude.exe is an overwrite install");
+
+            FakeFileOps withManifest = new FakeFileOps();
+            withManifest.Files["C:\\CC\\manifest.json"] = "{}";
+            Check(InstallerCore.IsOverwriteInstall("C:\\CC", withManifest),
+                  "a dir containing manifest.json is an overwrite install");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -814,6 +965,12 @@ namespace ClaudeCodeSetup
             Run("ParseUninstallArgs_TargetDir", Test_ParseUninstallArgs_TargetDir);
             Run("UnknownArgs_RecognisesRealCommandLine", Test_UnknownArgs_RecognisesRealCommandLine);
             Run("UnknownArgs_FlagsTypos", Test_UnknownArgs_FlagsTypos);
+
+            Run("AtomicPlace_MoveFails_OldExeKept", Test_AtomicPlace_MoveFails_OldExeKept);
+            Run("AtomicPlace_Success_KeepsBackupUntilCommit", Test_AtomicPlace_Success_KeepsBackupUntilCommit);
+            Run("Rollback_OverwriteKeepsExistingInstall", Test_Rollback_OverwriteKeepsExistingInstall);
+            Run("Rollback_FreshInstallDeletesDir", Test_Rollback_FreshInstallDeletesDir);
+            Run("IsOverwriteInstall", Test_IsOverwriteInstall);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);
