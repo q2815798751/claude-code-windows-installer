@@ -451,7 +451,7 @@
         未引入任何第三方依赖；源码保持 C# 5（纯函数 + `out` 参数，无新语法）；
         显式 `ls` 确认 `src\BuildInfo.cs` 仍在（未被 stub 污染）。**无卡点**。
 
-- [ ] **AW-5 修 `--keep-config` 无效开关（正确性，测试脚本的自欺）**
+- [x] **AW-5 修 `--keep-config` 无效开关（正确性，测试脚本的自欺）**
       问题：`build\test.bat:68` 传 `--keep-config`，但 `src\Program.cs:195` 只识别
       `--delete-config`（保留才是默认值），`--keep-config` 被**静默忽略**，
       测试脚本给人「显式保留了配置」的错觉。
@@ -460,6 +460,39 @@
       顺手：`Program.cs` 遇到**未知开关**时应该给出警告而不是静默忽略（如果现在就是静默忽略），
       这样以后类似的笔误不会再被吞掉。这条如果改动面大，单独记为后续条目，别在这项里做。
       新增用例：`--keep-config` → 断言配置被保留；`--delete-config` → 断言配置被删。
+      **结果（2026-10-17）**：完成（commit ae86b51）。
+      - **修法选 (a)**：让 `Program.cs` **显式支持 `--keep-config`**（幂等），`test.bat:68`
+        保持不变——显式优于隐含，测试脚本从此表达真实意图。契约：默认保留 `~/.claude`；
+        `--delete-config` 请求删除；`--keep-config` 把「保留」显式化（可覆盖前面的
+        `--delete-config`）；两者都给时以命令行中**最后出现的**那个为准（原实现是
+        「`--delete-config` 一出现就删」，无顺序概念——这是本项**唯一的行为变更**，
+        只影响同时给出两个开关的畸形输入；`test.bat` 从不同时给）。
+      - **实现**（`src\Program.cs`，C# 5）：抽纯函数 `ParseUninstallArgs(string[])`
+        → `internal struct UninstallArgs { bool KeepConfig; string TargetDir; }`
+        （`--target-dir=` 取第一个匹配，与旧 `ArgValue` 一致），`RunSilentUninstall`
+        改调它；`InstallerCore.Uninstall(ua.TargetDir, null, ua.KeepConfig, out err)`。
+      - **顺手项：做了**（判断为「改动面不大」）。新增纯函数 `UnknownArgs(args, flags, prefixes)`
+        返回未识别的开关，`Main` 在三个静默模式（selftest/install/uninstall）各调一次
+        `WarnUnknownArgs` 打一行「警告: 忽略无法识别的参数: …」。未知开关不再被静默吞掉。
+        已知集按模式定义（`SelfTestFlags/InstallFlags/UninstallFlags` + `--target-dir=`/`--report=`
+        前缀）；GUI 模式不解析命令行开关，未纳入。`test.bat` 的三条命令行开关全在已知集内
+        → 不产生警告、不改变其输出。
+      - **单测**（`tests\UnitTests.cs`，新增 6 用例 / 12 断言）：`--keep-config`→保留、
+        `--delete-config`→删除、无开关→默认保留、`--delete-config --keep-config`→保留
+        （后置覆盖）、`--target-dir=` 抽取、**`test.bat:68` 那条完整命令行未知开关数=0**
+        （直接锁住「`--keep-config` 被识别」）、笔误 `--keep-confgi` 被报为未知。
+        特别说明：**「`--keep-config`→保留」本身不判别**（保留是默认值，改前改后都绿），
+        真正判别修复的是「`--keep-config` 不再算未知开关」与「可覆盖前置 `--delete-config`」
+        这两条断言。`build\unit.bat` **40 用例 / 105 断言全绿，退出码 0**（AW-4 为 34/93）。
+      - **撤掉修复确认变红（定点破坏）**：只把 `UninstallFlags` 里的 `--keep-config` 删掉、
+        并把 `ParseUninstallArgs` 里对应的 `else if` 分支删掉（复现原 bug，不碰其他任何改动），
+        `grep` 确认工作树那两处确实已无 `--keep-config` 后重跑 →
+        **2 个用例变红（`ParseUninstallArgs_ExplicitKeepOverrides`、
+        `UnknownArgs_RecognisesRealCommandLine`）、2 个断言失败、退出码 1**；
+        还原后 `grep` 确认两处均已恢复、重跑 **105/105 全绿**（先确认回退生效再取信）。
+      - **红线**：本项只跑 `unit.bat`，**未跑 E2E、未触碰 `HKCU\Environment`**（无 `%TEMP%`
+        残留）；未引入任何第三方依赖；源码保持 C# 5（struct + 纯函数，无新语法）；
+        显式 `ls` 确认 `src\BuildInfo.cs` 仍在（858 字节，未被 stub 污染）。**无卡点**。
 
 - [ ] **AW-6 修「原子落盘」不原子 + Rollback 误删既有安装（健壮性）**
       问题两处：
