@@ -859,3 +859,60 @@
 逐条列出完成了什么、验证结果（用例数）、`BLOCKED` 项及原因、待确认项，
 并特别注明 **E2E 运行期间 `HKCU\Environment` 有没有被改动、是否已恢复**。
 然后向用户报告。**不要自己发明新条目继续做。**
+
+## 作业总结
+
+> 队列已清空（「当前进度」区全部 `[x]`，无 `BLOCKED`）。本节按「## 收尾」要求收口，不再新增条目。
+
+### 完成了什么（逐条，含最终用例数/断言数 + 关键验证方式）
+
+共 **16 项**全部完成。用例数为该条目完成时的 `build\unit.bat` 累计值（用例数只增不减）。
+
+- **AW-0 建验证基建**（`tests\UnitTests.cs` + `build\unit.bat` + `build\e2e-with-backup.bat`）——**23 用例 / 47 断言**。定点破坏：把 `Util.PrependPath` 拼接顺序反过来 → 2 用例变红（先 `git diff` 确认回退生效再取信）；E2E 注入哨兵 → 护栏检出改动并 `reg import` 恢复（`CHANGED-RESTORED`）。
+- **AW-1 修卸载误删用户环境变量**（仅当变量确由本安装器写入〔manifest `gitBashEnvWritten`〕且值未变时才删）——**29/68**。定点破坏：改回无条件删除 → 5 断言变红；E2E 注入哨兵卸载后仍在（`UNCHANGED`）。
+- **AW-2 修「用新 PATH 启动」假验证**（改走 `cmd /c claude --version`：裸命令名 + 新 PATH 只注入子进程 + 中性工作目录）——**31/80**。定点破坏：改回绝对路径 → 2 断言变红；E2E 真走 PATH 启动成功（未发现真 bug）。
+- **AW-16 修 `unit.bat` 的 BuildInfo stub 路径 bug**（块内 `%BI%`→`!BI!`）——**32/83**。**干净克隆复现**（修前 stub 污染 `src\BuildInfo.cs` 且 `CS2001` 退出 1；修后退出 0、`src\BuildInfo.cs` 未生成）；移植判别性用例 `RunViaPath`；定点破坏：`pathOverride`→`null` → 2 断言变红。
+- **AW-17 修 E2E 护栏把明文凭据留在 `%TEMP%`**（默认用完即删、`--keep-backup` 才留并告警、比对改用「值名 + sha256」清单）——**32/83**。定点破坏：注释掉 cleanup 的 `del` → `%TEMP%` 出现 `.reg` 的断言变红；`CHANGED-RESTORED` 用一次性 scratch 键等价 harness 验证（真实键注入被权限系统拒绝）。
+- **AW-18 查清并修 E2E「卸载后 claude.exe 仍在」假失败**（Phase 2 改为带超时轮询，异步延迟删除是契约）——**32/83**。连续 6 次真实 E2E 稳定 PASS；故意制造真失败仍报 FAIL（未退化成永远绿）；旧/新 `test.bat` 定点对照（旧 FAIL / 新 PASS）。
+- **AW-3 修预检文案与实现相反**（`末尾`→`前置`）——**33/86**。先让用例断言旧行为跑绿再改；定点破坏：`前置`→`末尾` → 2 断言变红。
+- **AW-4 修 32 位 Windows 被误判为 x64**（`X86` 从 `AMD64||X86` 拆成独立 `Fail` 分支）——**34/93**。定点破坏：`Fail`→`Pass` → 2 断言变红。
+- **AW-5 修 `--keep-config` 无效开关**（显式支持 + 未知开关不再静默吞掉）——**40/105**。定点破坏：删掉 `--keep-config` 识别 → 2 用例变红。
+- **AW-6 修「原子落盘」不原子 + Rollback 误删既有安装**（先备份后落盘；覆盖安装回滚不整体删目录）——**45/126**。两轮定点破坏（删还原调用、`if (wasOverwrite)`→`&& false`）分别 2 / 4 断言变红。
+- **AW-7 清理死代码与冗余判定**（删 `_logPath`、`OnSecondary` 冗余分支、`.gitignore` 重复项；`build<10240` 判定为「有副作用」故保留并抽纯函数）——**47/134**。两轮定点破坏（删 pre-Win10 文案分支、改外层阈值）分别 1 / 2 断言变红。
+- **AW-8 把 `docs\PLAN.md` 与实现对齐**（四处旧值→新值，以代码为准）——**47/134**（纯文档）。逐条 `file:line` 复核 + 对照表。
+- **AW-9 给 `docs\PLAN.md` 个人绝对路径脱敏**（`E:\Git`→占位符、`347 GB`→中性）——**47/134**（纯文档）。`git grep -nE '[A-Z]:\\\\' -- docs/` 改后零命中、退出码 1。
+- **AW-10 修 ARM64 下载分支临时文件泄漏**（固定名 `claude-arm64-payload.zip` + 下载前清理上一轮残留）——**50/143**。两轮定点破坏（改回随机 GUID 名、删 `CleanStaleTempZip` 调用）分别 5 / 1 断言变红。
+- **AW-11 给空 catch 补最小可观测性**（**仅** `Installer.cs` 里「删文件 / 删环境变量 / manifest」三类，记日志或返回失败；顺带修正 `RollbackDir` 返回值）——**62/178**。两轮定点破坏（`catch { return true; }`、静默 `catch { return false; }`）分别 2 / 1 断言变红。
+- **AW-12 加 CI**（`.github/workflows/ci.yml`：windows-latest 上 unit 测试 + 合成载荷 build + `--selftest`）——**62/178**。干净克隆里本地按 workflow 顺序四步退出码全 0；GitHub run **39012838712 success**。
+
+**定点破坏反向验证**：AW-0/1/2/3/4/5/6/7/10/11/16/17 均做了「撤掉修复 → 确认变红 → 装回 → 再确认全绿」，且每次**先确认回退本身生效**（`git diff`/`grep`/`sed` 佐证）再取信，避免假阳性。AW-8/9 为纯文档、AW-12 为 CI，无代码逻辑可破坏（AW-12 以「干净克隆本地四步全绿 + 真实 CI run」替代）。
+
+### 验证结果
+
+- **`build\unit.bat`（最终）：62 用例 / 178 断言，全绿，退出码 0**（`test methods : 62` / `assertions : 178 (passed 178, failed 0)` / `UNIT RESULT: PASS`）。收尾时在本机**实跑复核确认**（`src\BuildInfo.cs` 未被污染，仍 858 字节）。
+- **CI：GitHub Actions run `39012838712`，branch `autowork/2026-10-16`，head sha `13cb8b2`，status=completed / conclusion=success**，约 16s（`https://github.com/q2815798751/claude-code-windows-installer/actions/runs/39012838712`）。逐步全 success。
+- **E2E 期间 `HKCU\Environment` 有没有被改动 / 是否已恢复**：正常 E2E（`build\e2e-with-backup.bat`）**未被改动**（逐字节 `UNCHANGED`）。AW-1 修复**前**的注入实验曾删掉注入的哨兵变量（旧 bug 现象），经护栏 `reg import` **恢复**并逐字节复验；此后每次真实 E2E 都经护栏备份/比对。收尾核对：`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 与 `ANTHROPIC_AUTH_TOKEN` 均在、无哨兵残留、`%TEMP%` 无 `env-backup*`/`env-after*`/`cc-uninstall-*` 残留。
+
+### BLOCKED 项
+
+**没有。** 全部 16 项均完成，无一项标 `BLOCKED`，也没有「连续失败两次」的死磕项。
+
+### 待确认项（汇总，等用户拍板）
+
+1. **32 位 Windows 怎么处理？** AW-4 默认按「拒绝安装（Fail）」实现；若安装器有意允许 32 位系统，应改为「警告 + 允许继续」。
+2. **卸载时那个环境变量到底该不该删？** AW-1 按「只在由本安装器写入时才删」实现。若要「卸载就删干净」是另一契约。另：若用户**安装前**已自配该变量、被安装器覆盖，卸载会按契约删除（**用户原值丢失**）——是否改成「安装时记录用户原值、卸载时还原」属产品决策。
+3. **38 处空 catch 要不要全面加日志？** AW-11 只做了 `Installer.cs` 里「删文件 / 删环境变量 / manifest」相关站点，其余全部保持不动（含 `Installer.cs` 的 install.log 合并 / `Verify` 读注册表 / `LooksLikeClaudeHome` 探测 / `ReadUserPathRaw`·`ReadUserPathKind` / `RunCapture` 的 `p.Kill()`，以及 `Common.cs`/`Program.cs`/`MainForm.cs`/`Checks.cs` 里的全部）。
+4. **要不要把 E2E 加进 CI？** AW-12 明确没加（写盘量 + 网络依赖）。
+5. **`docs/PLAN.md` 是活文档还是历史存档？** AW-8 已判定为「活文档/设计规格」并据此逐条改文档对齐代码；若希望它冻结成「当时的计划」，可改为在文首声明「历史计划，实现以代码为准」。
+6. **要不要给仓库加 LICENSE？** 目前没有（`VERSION` = 2.1.268，跟上游版本走）。
+
+### 本机需要额外动作的事项
+
+- **重新打包才会到用户机器上的修复**：全部安装器行为修复都在 `src\` 源码里，而用户拿到的是产物 `dist\ClaudeCodeSetup.exe`（被 `.gitignore`，不入库）。要让 **AW-1/AW-2/AW-6/AW-10/AW-11** 等修复真正生效，须在**有真实载荷的本机**重新跑 `build\build.bat` 重新打包。⚠️ **当前 `dist\ClaudeCodeSetup.exe` 构建于 2026-10-17 13:44，早于 AW-11 对 `src\Installer.cs` 的最后改动（14:51）**——即现有 exe **不含 AW-11 的修复**，需重打包才会带上。
+- **`src\BuildInfo.cs` 被 gitignore**（本机 858 字节，不入库）：新克隆 / CI 里由 `unit.bat` 生成占位 stub、或由 `build.bat` 的 prep 步骤生成真实版本哈希；**别把它当污染**，但也别提交它。
+- **真实载荷不入库**：`payload\claude-win32-x64.zip`（约 95 MB）本机已存在（99,598,997 B）；CI 改用 `build\ci-payload.ps1` 合成载荷（169 B，零网络依赖），真实载荷完整性仍由 `build\build.bat` 在有真载荷时强制。
+
+### 验证基建现状（覆盖什么 / 哪些区域仍是零覆盖）
+
+- **覆盖到什么**：`build\unit.bat` 会**一次编译全部产品源码**（等于一次全项目编译检查），再跑 **62 个纯逻辑用例**，覆盖：`Util`（NormalizeDir / PathContains / PrependPath / NativeArch / Sha256File）、`InstallerCore`（FirstToken / RunViaPath / VerifyLaunchViaPath / AtomicPlace / CommitBackup / RestoreOverwriteBackup / RollbackDir / Rollback / IsOverwriteInstall / ARM64 临时 zip 三函数 / GitBash 归属三函数 / TryDeleteFile·TryDeleteDir·RemoveGitBashEnvIfOwned / ReadGitBashManifest）、`Preflight` 纯函数（ExistingAdvice / ArchVerdict / OsVerdict）、`NetProbe.Score`·`Summary`、`Payload.Locate`、`SubStream`、`Const.RequiredFreeBytes`、`Program` 参数解析（ParseUninstallArgs / UnknownArgs）。另有 `build\e2e-with-backup.bat` 护栏（真 `reg export` / 逐字节 `fc /b` 比对 / 真 `reg import` 恢复复验 / 备份失败即拒绝运行）与 CI（unit + 合成载荷 build + `--selftest`）。
+- **仍是零覆盖（如实，别高估）**：`src\MainForm.cs`（GUI 全部，零覆盖）；`src\Uninstaller.cs`（独立 exe，零直接覆盖）；`src\Checks.cs` 里**真正做注册表 / 文件系统 / PATH 探测的 `Check*` 外壳**（只覆盖了从中抽出的纯函数 `Preflight.*`）；`src\Program.cs` 的编排（`RunSilentInstall` / 自检链路，只覆盖了纯参数解析）；**真实磁盘 / 注册表 / 网络 I/O**（单测只走注入的 `IFileOps` 假文件系统与委托）；**E2E（`build\test.bat`）不在 CI 里**，只靠人工经护栏跑。即：现有 62 个用例覆盖的是「可抽出的纯逻辑」，不是端到端行为。
