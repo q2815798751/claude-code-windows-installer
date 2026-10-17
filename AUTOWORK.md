@@ -251,7 +251,7 @@
         （「卸载路径当前会无条件删除用户级环境变量」），改为如实描述「会写入用户级
         环境变量，护栏仍值得保留；无条件删除问题已在 AW-1 修复」。
 
-- [ ] **AW-17 修 E2E 护栏把明文凭据留在 `%TEMP%`（AW-0 复查实测，安全）**
+- [x] **AW-17 修 E2E 护栏把明文凭据留在 `%TEMP%`（AW-0 复查实测，安全）**
       > 编号后补，优先级高于 AW-2（涉及真实凭据；用户已于 2026-10-17 拍板处理方式）。
 
       AW-0 的对抗性复查**实测**出：`build\e2e-with-backup.bat` 按设计**保留**
@@ -272,6 +272,46 @@
       ⚠️ 修的时候**别把护栏的核心保证改坏**——复查已确认它是真安全门：
       真 `reg export`、真逐字节 `fc /b` 比对、真 `reg import` 恢复复验，
       而且**备份失败时会拒绝运行 E2E**（这点比 dsh 那边的护栏强）。这条必须保持。
+      **结果（2026-10-17）**：完成（commit b71790c）。
+      - **契约**：`build\e2e-with-backup.bat` 的备份**默认只在运行期间存在，跑完立即删除**；
+        只有显式传 `--keep-backup` 才保留，保留时打印**明文凭据警告**并列出该文件里含哪些
+        **敏感值名**。比对结论不再依赖保留的明文——每次 `reg export` 之后另存一份
+        **「值名 + 值 sha256」清单**，两份清单也会一起比对。
+      - **实现**：
+        - `build\e2e-with-backup.bat`：新增 `--keep-backup` 参数解析（用 `goto` 循环逐行 `set`，
+          在 `DisableDelayedExpansion` 下也能正确累积转发参数，且不把该开关转给 `test.bat`）；
+          cleanup 默认删 `.reg` 与清单，`--keep-backup` 走警告分支（`findstr` 在清单里筛敏感值名）。
+        - 新增 `build\env-hash.ps1`（ASCII-only，PowerShell 5.1）：把 `reg export` 产物按
+          **UTF-16LE** 读入（普通文本工具直搜会假阴性），逐值写 `<值名>\t<sha256>` 清单，盘上不含明文。
+      - **护栏核心保证逐条保持**：真 `reg export`、真逐字节 `fc /b` 比对（`.reg` 与清单各比一次）、
+        真 `reg import` 恢复 + 重新导出复验、**备份失败即拒绝运行 E2E**（`exit /b 1`）、
+        退出码透传 `test.bat`。清单比对失败是非致命的（`fc /b` 仍是权威判定）。
+      - **验证**：
+        - 真实 E2E（默认，无开关）：**E2E 跑完 → `HKCU\Environment: UNCHANGED`、备份已删、
+          `%TEMP%` 无 `env-backup*`/`env-after*` 残留**。（该次 E2E 自身报 FAIL：卸载后
+          `claude.exe` 仍在——是 `test.bat` 的**既有竞态**：卸载器目录被占用时走
+          `ScheduleDelete` 延迟删除，而 `test.bat` 同步检查；目录稍后确实消失。与 AW-17 无关。）
+        - `--keep-backup`：备份**保留**、打印明文凭据警告、并列出敏感值名
+          `ANTHROPIC_AUTH_TOKEN`（只列名 + hash，无明文）；测完立即手工删除该文件。
+        - **撤掉修复确认变红（定点破坏）**：把 cleanup 里删备份的两行 `del` 改成一句
+          `rem`（模拟修复前的泄漏），`git diff` 确认改动存在后跑护栏 → `%TEMP%` **出现**
+          `env-backup-*.reg` → 「无残留」断言**变红**；还原后 `git diff` 确认该 `rem` 已消失、
+          再跑 → 无残留 → **绿**。
+        - **CHANGED-RESTORED**：向**真实** `HKCU\Environment` 注入哨兵被**权限系统拒绝**
+          （正确的安全门，未绕过）。改用**等价 harness**：把护栏复制到临时目录、仅把
+          目标键换成一次性 scratch 键 `HKCU\Software\AW17Scratch`、`TEST` 换成一个删除
+          `Sentinel` 的 stub（**比对/恢复逻辑与仓库版本逐字节相同**，`git diff` 佐证），
+          跑出 **`CHANGED-RESTORED`**、`Sentinel` 被 `reg import` 还原；scratch 键测完已删。
+        - 单测 `build\unit.bat`：**32 用例 / 83 断言全绿，退出码 0**（未改 C#，与 AW-16 同）。
+        - **收尾核对**：`HKCU\Environment` 完好——9 个键，`ANTHROPIC_AUTH_TOKEN` 与
+          `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 都在，无哨兵残留；
+          `%TEMP%` 无 `env-backup*`/`env-after*`。
+      - **文档**：`README.md` 的「测试」节补 `--keep-backup`、凭据安全说明与「清单不依赖明文」；
+        目录结构加 `build\env-hash.ps1`。
+      - ⚠️ **AW-17 第 4 点（顺手项）未适用**：全仓（含 `git log --all`）grep `--yes`
+        **只命中 AUTOWORK.md 自身**，README 里**没有**「非交互环境不加 `--yes` 就只打印计划、
+        不落盘」这段文案，本仓库也没有 `--yes`/dry-run 概念——**无可改**，如实记录
+        （疑似来自其他项目护栏文档的串味）。
 
 - [ ] **AW-3 修预检文案与实现相反（正确性）**
       ⚠️ **前置要求（AW-0 复查点名）**：`src\Checks.cs` **当前零单测覆盖**——
