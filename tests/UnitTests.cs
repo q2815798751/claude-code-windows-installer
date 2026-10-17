@@ -540,15 +540,64 @@ namespace ClaudeCodeSetup
             EqInt(1, r1.VerifyFailures.Count, "non-zero exit code is recorded as a failure");
 
             // Zero exit but unexpected output -> also a failure.
+            // NOTE: the bogus output must NOT contain BuildInfo.ReleaseVersion for
+            // ANY value, otherwise this assertion is a false red in a fresh clone
+            // where unit.bat generates a stub with ReleaseVersion = "0.0.0"
+            // (AW-16). A digit-free sentinel keeps the test version-agnostic.
             InstallResult r2 = new InstallResult();
             PathRunner wrongVer = delegate(string command, string args, string workDir,
                                            int timeoutMs, string pathOverride, out string output)
             {
-                output = "0.0.0-not-the-expected-version";
+                output = "unexpected-output-not-a-version";
                 return 0;
             };
             InstallerCore.VerifyLaunchViaPath("C:\\CC", r2, wrongVer);
             EqInt(1, r2.VerifyFailures.Count, "unexpected version output is recorded as a failure");
+        }
+
+        // ---- AW-16: InstallerCore.RunViaPath really resolves through PATH ----
+        //
+        // This is the discriminating test AW-2's review asked for. The stub-based
+        // VerifyLaunchViaPath tests only assert what is handed to the injected
+        // runner; a stub never touches PATH, so those assertions cannot prove that
+        // PATH is actually resolved. This test drives the *production* RunViaPath
+        // against a fake claude.cmd that exists ONLY as a .cmd on a temp PATH:
+        //   - PATH containing that dir  -> the command resolves and succeeds;
+        //   - PATH without it           -> the command is not found and fails.
+        // If the launch verification is ever changed back to a fake (e.g. resolved
+        // by an absolute path that bypasses PATH), the bare "claude" would no
+        // longer be found via PATH and this test goes red.
+        private static void Test_RunViaPath_ResolvesThroughPath()
+        {
+            string root = TempDir();
+            string binDir = Path.Combine(root, "bin");
+            string emptyDir = Path.Combine(root, "empty");
+            string workDir = Path.Combine(root, "work");
+            Directory.CreateDirectory(binDir);
+            Directory.CreateDirectory(emptyDir);
+            Directory.CreateDirectory(workDir);
+            try
+            {
+                // A fake "claude" that exists only as claude.cmd, so it can be found
+                // exclusively through PATH (cmd.exe resolves .cmd via PATHEXT).
+                string marker = "aw16-fake-claude-9.9.9";
+                File.WriteAllText(Path.Combine(binDir, "claude.cmd"),
+                    "@echo off\r\necho " + marker + "\r\n", new UTF8Encoding(false));
+
+                // The work dir must be neutral (no claude.cmd), so resolution can
+                // only happen through PATH and not via the current directory.
+                string outp;
+                int okCode = InstallerCore.RunViaPath("claude", "--version", workDir,
+                                                      60000, binDir, out outp);
+                EqInt(0, okCode, "RunViaPath resolves bare 'claude' via PATH (exit 0)");
+                Check(outp != null && outp.IndexOf(marker, StringComparison.Ordinal) >= 0,
+                      "RunViaPath returns the fake command's output");
+
+                int failCode = InstallerCore.RunViaPath("claude", "--version", workDir,
+                                                        60000, emptyDir, out outp);
+                Check(failCode != 0, "RunViaPath fails when the command is not on PATH");
+            }
+            finally { RmTree(root); }
         }
 
         // ---------------------------------------------------------------- main
@@ -599,6 +648,7 @@ namespace ClaudeCodeSetup
 
             Run("VerifyLaunchViaPath_UsesBareNameOnPath", Test_VerifyLaunchViaPath_UsesBareNameOnPath);
             Run("VerifyLaunchViaPath_ReportsFailure", Test_VerifyLaunchViaPath_ReportsFailure);
+            Run("RunViaPath_ResolvesThroughPath", Test_RunViaPath_ResolvesThroughPath);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);

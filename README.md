@@ -192,8 +192,10 @@ build\unit.bat            :: 全部通过退出码 0，任一断言失败退出�
 ```
 
 **端到端测试（`build\e2e-with-backup.bat`）**：`build\test.bat` 会**真的安装并卸载**，
-而卸载路径当前会无条件删除用户级环境变量（见 `AUTOWORK.md` 的 AW-1）。因此不要直接
-跑 `build\test.bat`，而应通过带环境护栏的包装脚本：
+会写入用户级环境变量（`PATH`、以及找到 Git Bash 时的 `CLAUDE_CODE_GIT_BASH_PATH`），
+所以不要直接跑 `build\test.bat`，而应通过带环境护栏的包装脚本。
+（早期卸载器会无条件删除用户级 `CLAUDE_CODE_GIT_BASH_PATH`，该问题已在 AW-1 修复：
+现在仅当该变量确由本安装器写入、且值未被改动时才移除；护栏仍然值得保留。）
 
 ```cmd
 build\e2e-with-backup.bat         :: 先备份 HKCU\Environment，跑 E2E，再比对/必要时恢复

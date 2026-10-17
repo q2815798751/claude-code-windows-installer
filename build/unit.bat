@@ -47,22 +47,27 @@ rem absent (e.g. a fresh clone / CI), generate a harmless stub so the unit tests
 rem stay self-sufficient. The tested logic does not depend on its values.
 set "BI=%SRC%\BuildInfo.cs"
 if not exist "%BI%" (
+  rem  Delayed expansion (!BI!) is mandatory here: %BI% inside a parenthesised
+  rem  block is expanded once, when the whole block is parsed, so it would still
+  rem  hold the OLD value (src\BuildInfo.cs) and the stub would be written into
+  rem  the source tree, then the compile step would fail with CS2001 on the new
+  rem  path. That only shows up in a fresh clone (no src\BuildInfo.cs).
   set "BI=%WORK%\BuildInfo.stub.cs"
   echo  NOTE: %SRC%\BuildInfo.cs missing - generating a stub for the unit build.
-  >  "%BI%" echo namespace ClaudeCodeSetup
-  >> "%BI%" echo {
-  >> "%BI%" echo     internal static class BuildInfo
-  >> "%BI%" echo     {
-  >> "%BI%" echo         internal const string ReleaseVersion = "0.0.0";
-  >> "%BI%" echo         internal const string ReleaseTag     = "v0.0.0";
-  >> "%BI%" echo         internal const string AssetName      = "claude-win32-x64.zip";
-  >> "%BI%" echo         internal const string ReleaseUrl     = "";
-  >> "%BI%" echo         internal const string PayloadSha256  = "";
-  >> "%BI%" echo         internal const string BinarySha256   = "";
-  >> "%BI%" echo         internal const string Arm64AssetName = "claude-win32-arm64.zip";
-  >> "%BI%" echo         internal const string Arm64Sha256    = "";
-  >> "%BI%" echo     }
-  >> "%BI%" echo }
+  >  "!BI!" echo namespace ClaudeCodeSetup
+  >> "!BI!" echo {
+  >> "!BI!" echo     internal static class BuildInfo
+  >> "!BI!" echo     {
+  >> "!BI!" echo         internal const string ReleaseVersion = "0.0.0";
+  >> "!BI!" echo         internal const string ReleaseTag     = "v0.0.0";
+  >> "!BI!" echo         internal const string AssetName      = "claude-win32-x64.zip";
+  >> "!BI!" echo         internal const string ReleaseUrl     = "";
+  >> "!BI!" echo         internal const string PayloadSha256  = "";
+  >> "!BI!" echo         internal const string BinarySha256   = "";
+  >> "!BI!" echo         internal const string Arm64AssetName = "claude-win32-arm64.zip";
+  >> "!BI!" echo         internal const string Arm64Sha256    = "";
+  >> "!BI!" echo     }
+  >> "!BI!" echo }
 )
 
 rem ---------------------------------------------------------------- step 2 ----
