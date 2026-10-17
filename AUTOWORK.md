@@ -313,7 +313,7 @@
         不落盘」这段文案，本仓库也没有 `--yes`/dry-run 概念——**无可改**，如实记录
         （疑似来自其他项目护栏文档的串味）。
 
-- [ ] **AW-18 查清真实 E2E 的「卸载后 claude.exe 仍在」假失败（AW-17 实测发现，测试基建可信度）**
+- [x] **AW-18 查清真实 E2E 的「卸载后 claude.exe 仍在」假失败（AW-17 实测发现，测试基建可信度）**
 
       AW-17 的 worker 跑**真实 E2E** 时发现 `build\test.bat` **自身报 FAIL**：
       Phase 2 卸载后检查 `claude.exe` 仍在，于是 `E2E RESULT: FAIL`。
@@ -332,6 +332,47 @@
       验证方式：连续跑 E2E 若干次确认**稳定 PASS**（不是碰巧）；
       并且**故意制造一次真失败**（例如让卸载器少删一个文件）确认它**仍能报 FAIL**——
       即修完不会退化成「永远绿」。这两条缺一不可。
+      **结果（2026-10-17）**：完成（commit dea8b61）。
+      - **真实成因（复现 + 定位）**：`build\test.bat` Phase 2 卸载后**同步**检查
+        `if exist "%SANDBOX%\claude.exe"`，而卸载器的目录删除是**异步**的——
+        `InstallerCore.Uninstall` 里 `Directory.Delete(dir, true)` 一旦因**任何**瞬时句柄占用
+        （杀软扫描刚写入的 221 MB `claude.exe`、句柄尚未释放等）抛异常，就回退到
+        `ScheduleDelete`：一个脱离的 `cmd`，`ping -n 4`（约 3s）后 `rd /s /q`。
+        检查跑在删除之前，于是**假 FAIL**；目录约 4s 后确实消失。
+        用「持有 `claude.exe` 句柄（`FileShare.None`）→ 卸载」**确定性复现**：
+        卸载返回瞬间 `claude.exe` 仍在（旧检查 FAIL），释放句柄后延迟删除完成、目录消失。
+      - **注释与实现哪一方错**：**注释错**。旧注释写「被测 exe 在沙箱之外，所以卸载器的
+        延迟自删不参与，应当期望目录消失」——它把「延迟删除」等同于「自删」。
+        自删确实不参与（被测 exe 是 `dist\ClaudeCodeSetup.exe`，在沙箱外），
+        但**延迟删除并不只由自锁触发**：任何瞬时锁都会走 `ScheduleDelete`。
+        实现（异步回退 + 延迟删除）是**有意的、正确的**；注释的推理不成立。
+      - **修法及理由**：选「让检查等延迟删除完成（带超时）」，而非「让卸载器同步删除」。
+        理由：卸载器**保留**延迟删除回退是正确设计（真实场景里 `Uninstall.exe` 从沙箱内
+        自删时根本不可能同步删掉自己），所以异步才是契约；E2E 必须容忍这个已文档化的延迟。
+        实现：Phase 2 的 claude.exe 检查改为**带超时的轮询**——
+        `for /L %%I in (1,1,30)` 每轮 `ping -n 2`（约 1s），文件消失即 `goto` 跳出，
+        最多等约 30s；**超时仍报 FAIL**（没有删掉检查，也没有无条件放行）。
+        正常情况第一轮就跳出（不拖慢），只在真延迟时等待。
+      - **注释**：按「注释错」的结论重写，与实现一致（说明删除是异步的、以及为何轮询）。
+      - **验证（缺一不可，全部完成）**：
+        1. **稳定 PASS**：干净 `dist` 下连续跑 `build\e2e-with-backup.bat` **6 次全部 PASS、
+           exit 0、`HKCU\Environment: UNCHANGED`**（改前另跑过 15 次 PASS 作基线）。
+        2. **仍能报 FAIL（不退化成永远绿）**：临时把 `Uninstall` 改成「删掉除 `claude.exe`
+           以外的所有文件、且不安排延迟删除」（`git diff` 确认改动存在），重编译 → 跑真实
+           `build\e2e-with-backup.bat` → **`FAIL claude.exe still present after uninstall
+           (waited ~30s...)`、`E2E RESULT: FAIL`、exit 1**；随后 `git checkout -- src\Installer.cs`
+           回退、`git diff` 确认改动消失后重编译。
+        3. **定点复现「旧 FAIL / 新 PASS」**：把 HEAD 版与修复版 `test.bat` 各复制一份，
+           仅在 Phase 2 卸载前后注入「持有 `claude.exe` 句柄 / 卸载后释放」两行（其余逐字节相同），
+           跑同一锁场景：**旧版 `E2E RESULT: FAIL`（exit 1）**、**新版 `E2E RESULT: PASS`（exit 0，
+           轮询等到延迟删除完成）**。harness 副本与临时脚本跑完已删。
+      - **单测**：`build\unit.bat` **32 用例 / 83 断言全绿，退出码 0**（未改 C#，与 AW-16 同）。
+      - **环境安全**：全部实验用 `--no-system`（无 PATH/env 写入）；每次真实 E2E 都经
+        `build\e2e-with-backup.bat` 备份/比对；收尾 `HKCU\Environment` 与实验前备份
+        **逐字节 IDENTICAL**（9 个键，`ANTHROPIC_AUTH_TOKEN` 与
+        `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 均在）；
+        手工备份的明文 `.reg` 用完**立即删除**，`%TEMP%` 无 `env-backup*`/`env-after*`/
+        `cc-uninstall-*` 残留。
 
 - [ ] **AW-3 修预检文案与实现相反（正确性）**
       ⚠️ **前置要求（AW-0 复查点名）**：`src\Checks.cs` **当前零单测覆盖**——
