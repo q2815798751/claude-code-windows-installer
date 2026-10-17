@@ -149,7 +149,7 @@
         路径，则 manifest 记为「本安装器写入」，卸载按契约删除 → 用户原值丢失。是否要
         「记录并在卸载时还原用户原值」属产品决策。
 
-- [ ] **AW-2 修「用新 PATH 启动」的假验证（正确性 + 验证有效性）**
+- [x] **AW-2 修「用新 PATH 启动」的假验证（正确性 + 验证有效性）**
       问题：`src\Installer.cs:283-296` 第 286 行把安装目录并入 PATH，
       第 288 行却用 `RunCapture(exe, …)`，而 `exe`（第 245 行）是 `dir\claude.exe` 的**绝对路径**。
       这个「验证」根本不经过 PATH 解析，`README.md:82` 与 `docs\PLAN.md:120`
@@ -159,6 +159,34 @@
       若改为真走 PATH 后发现失败，说明 PATH 生效链路有真问题——**那是真 bug，不要为了让它变绿而退回绝对路径**，
       如实记录并判断是否该标 BLOCKED。
       新增用例：断言调用参数是裸命令名而非绝对路径（可用可注入的 runner 打桩）。
+      **结果（2026-10-17）**：完成（commit 916c4cf）。
+      - **契约**：安装后验证第 3 步必须**真走 PATH**——传裸命令名 `claude`，让它经 PATH 解析到
+        安装目录的 claude.exe；新 PATH 只注入**临时子进程环境**，不碰当前进程/系统。
+        旧实现传 `dir\claude.exe` 绝对路径，根本没经过 PATH，是假验证。
+      - **实测关键发现（决定了实现方式）**：`Process.Start("claude", …)`（`UseShellExecute=false`）
+        配 `psi.EnvironmentVariables["PATH"]=新PATH` **解析不到**——CreateProcess 解析裸命令名用的是
+        **调用进程**的 PATH，对子进程环境块里的 PATH 覆盖无效（本机探针实测：直接传裸名报
+        「系统找不到指定的文件」；只有改当前进程 PATH 才行）。故改为借 `cmd.exe /c claude --version`：
+        cmd 按**自身环境**里的 PATH 解析，既能真走 PATH，又只需注入子进程环境、不污染当前进程。
+      - **第二个陷阱**：工作目录不能是安装目录，否则命令会被「当前目录」直接命中而**再次绕过 PATH**
+        （cmd 默认搜当前目录；本机因设了 `NoDefaultCurrentDirectoryInExePath=1` 才恰好没暴露）。
+        故验证时改用**中性工作目录**（用户主目录），确保命令只能靠 PATH 解析到。
+      - **实现**（`src\Installer.cs`，C# 5）：新增可注入委托 `PathRunner`；`VerifyLaunchViaPath(dir, r, runner)`
+        传裸名 `"claude"` + 新 PATH（`Util.PrependPath`）；`RunViaPath` 用 `cmd.exe /c` 真正按 PATH 执行；
+        `RunCapture` 新增 `pathOverride` 重载（只写 `psi.EnvironmentVariables["PATH"]`，绝不动当前进程）。
+        删掉旧的「临时改当前进程 PATH + 绝对路径」块。
+      - **单测**：新增 2 个用例 / 12 个断言（裸命令名、非绝对路径、新 PATH 注入、工作目录中性、
+        当前进程 PATH 不变、失败记录）。`build\unit.bat` **31 用例 / 80 断言全绿，退出码 0**（AW-1 为 29/68）。
+      - **测试有效性**：把 `runner("claude", …)` 临时改回绝对路径 `Path.Combine(dir, "claude.exe")`，
+        `git diff` 确认改动**确实存在**后重跑 → **2 个断言变红、退出码 1**；改回后 `git diff` 中该行消失、
+        重跑 **80/80 全绿**（先确认回退生效再取信）。
+      - **E2E（含真安装）**：重编译 `dist` → `build\e2e-with-backup.bat` 跑沙箱装/卸：**E2E PASS**，
+        验证第 3 步打印 `[OK] 启动测试 claude --version 2.1.268 (Claude Code)`——**真走 PATH 的启动链路工作正常**，
+        **未发现真 bug，无需 BLOCKED**。`HKCU\Environment: UNCHANGED`（逐字节比对）。
+        备份 .reg（含明文凭据）跑完**已立即删除**，`%TEMP%` 无残留；
+        `ANTHROPIC_AUTH_TOKEN` 与 `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` 均在。
+      - **文档**：`README.md:82`、`docs\PLAN.md:120` 宣称的「用新 PATH 实际启动 `claude --version`」
+        现在**名副其实**，无需改文档。
 
 - [ ] **AW-16 修 `unit.bat` 的 BuildInfo stub 路径 bug（AW-0 复查实测，中等）**
       > 编号后补，但**优先级高于 AW-2**——它挡着「在干净克隆里验证」这条所有人都会走的路。
