@@ -552,7 +552,7 @@
         仍在（858 字节，未被 stub 污染）。README:71「原子落盘」与 77「自动回滚」的表述
         现在名副其实，无需改文档。**无卡点**。
 
-- [ ] **AW-7 清理死代码与冗余判定（打磨）**
+- [x] **AW-7 清理死代码与冗余判定（打磨）**
       四处（`src\MainForm.cs:43` 的 `_logPath` 只在 511 行赋值、全文件从未读取；
       `src\MainForm.cs:516-524` 的 `if (_installDone && …StartsWith("完"))` 分支与随后的
       `Close()` 行为相同；`src\Checks.cs:198-204` 的 `if (build < 10240)` 被紧随其后的
@@ -562,6 +562,50 @@
       **没有任何副作用**（比如设置状态、写日志）才能删；有副作用就保留并改成能说明意图的形式。
       新增用例：删掉 `Checks.cs` 冗余分支后，断言 OS 版本判定的边界行为不变
       （build = 10240 / 17763 / 17762 三档）。
+      **结果（2026-10-17）**：完成（commit cce31a1）。四处处理如下：
+      - **① `src\MainForm.cs` 的 `_logPath`**：删除字段声明（旧 43 行）**及它唯一的赋值处**
+        （旧 508-513 的 `try { ... File.Exists(install.log) ... } catch {}` 整块）。
+        `grep _logPath` 全仓只剩这两处（声明 + 赋值），**全文件从未读取**，是纯死代码。
+        被删的 try 块只做 `File.Exists` 后赋给该字段，无 I/O、无副作用；`Util.InstallDir()`
+        是纯 getter。删除后无行为变化（编译通过 + 单测全绿）。
+      - **② `src\MainForm.cs` 的 `OnSecondary`**：删除
+        `if (_installDone && _btnSecondary.Text.StartsWith("完", …)) { Close(); return; }`，
+        只留 `Close();`——原分支与随后的 `Close()` 行为完全相同，是冗余判定（条件只读字段，
+        无副作用）。`_installDone` 在别处（219/366/499 行）仍被使用，未变孤儿。
+      - **③ `src\Checks.cs` 的 `if (build < 10240)`：判断为「不是纯冗余分支」，按规则保留**
+        （**有副作用**）。理由：它**并非被紧随其后的 `if (build < 17763)` 完全覆盖**——
+        `State`（都是 Fail）与 `Detail` 相同，但 **`Advice` 文案不同**：
+        `build < 10240`（Windows 10 之前，如 Win7/8/8.1）是
+        「Claude Code 需要 Windows 10 1809 (build 17763) 或更高版本。」，
+        `10240..17762`（Win10 但过旧）是「版本过旧，需要 Windows 10 1809…」。
+        即该分支**设置了返回项的状态并提前 return，且 Advice 与下一条不同**（可观察的副作用）；
+        删掉会改变 `build < 10240` 时用户看到的提示文案。故按「有副作用就保留并改成能说明
+        意图的形式」处理：把判定逻辑抽成**纯函数 `Preflight.OsVerdict(int build, string name)`**
+        （AW-3/AW-4 同款套路），`CheckOs` 只负责读注册表后调它；两档合成一个
+        `if (build < 17763)` 块，按 `build < 10240` 选 Advice，并加注释说明它为何不是可删的
+        冗余分支。**行为逐字保持**（三档 Advice/State/Detail 与改前一致）。
+      - **④ `.gitignore`**：删除第 25 行重复的 `build/work/`（第 6 行「构建中间产物」已列出），
+        ignore 语义不变。
+      - **新增用例**（`tests\UnitTests.cs`，2 用例 / 8 断言）：
+        `Test_OsVerdict_Boundaries`（build=10240→Fail、17762→Fail、17763→Pass，
+        并断言 detail 带 build 号）与 `Test_OsVerdict_PreWindows10Advice`
+        （pre-Win10（9600）的 Advice 含 ASCII 标记 `"Claude Code"`、10240 的 Advice 不含，
+        锁住两档文案区别）。测试文件保持 ASCII-only（用 ASCII 标记而非中文字面量）。
+      - **用例数**：`build\unit.bat` **47 用例 / 134 断言全绿，退出码 0**（AW-6 为 45/126）。
+      - **撤掉修复确认变红（定点破坏，两轮，每轮先确认回退生效）**：
+        ① 模拟「删掉 `build < 10240` 分支」（把两档 Advice 合一为「版本过旧…」），
+        `grep` 确认工作树里已无 `if (build < 10240)` 代码行、且「Claude Code 需要」那行已消失
+        （回退生效）→ **`OsVerdict_PreWindows10Advice` 1 断言变红、退出码 1**
+        （**证明删掉它确有行为变化 → 印证「保留」的决定**）；还原后 `grep` 确认已恢复、
+        重跑 **134/134 全绿**。
+        ② 把外层阈值 `build < 17763` 改成 `build < 10240`，`sed` 确认工作树已生效 →
+        **`OsVerdict_Boundaries` 2 断言变红、退出码 1**；还原后 `grep` 确认外层回到 17763、
+        重跑 **134/134 全绿**（先确认回退生效再取信）。
+      - **红线**：本项只跑 `unit.bat`（它编译全部产品源码 = 全项目编译检查），
+        **未跑 E2E、未触碰 `HKCU\Environment`**（无 `%TEMP%` 残留）；未引入任何第三方依赖；
+        源码保持 C# 5（纯函数，无新语法）；测试文件 ASCII-only
+        （`LC_ALL=C grep '[^ -~]'` = 0 命中）；显式 `ls` 确认 `src\BuildInfo.cs` 仍在
+        （858 字节，未被 stub 污染）。**无卡点**。
 
 - [ ] **AW-8 把 `docs\PLAN.md` 与实现对齐（文档）**
       四处不一致：
