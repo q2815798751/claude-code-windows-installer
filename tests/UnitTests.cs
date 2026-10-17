@@ -471,6 +471,86 @@ namespace ClaudeCodeSetup
             finally { RmTree(d); }
         }
 
+        // ---- AW-2: InstallerCore.VerifyLaunchViaPath ----------------------
+
+        private static void Test_VerifyLaunchViaPath_UsesBareNameOnPath()
+        {
+            InstallResult r = new InstallResult();
+
+            string seenCmd = null;
+            string seenArgs = null;
+            string seenWorkDir = null;
+            string seenPath = null;
+            int seenTimeout = -1;
+
+            PathRunner stub = delegate(string command, string args, string workDir,
+                                       int timeoutMs, string pathOverride, out string output)
+            {
+                seenCmd = command;
+                seenArgs = args;
+                seenWorkDir = workDir;
+                seenTimeout = timeoutMs;
+                seenPath = pathOverride;
+                output = BuildInfo.ReleaseVersion + " (Claude Code)";
+                return 0;
+            };
+
+            string beforePath = Environment.GetEnvironmentVariable("PATH");
+            InstallerCore.VerifyLaunchViaPath("C:\\CC", r, stub);
+
+            // The whole point of AW-2: the command must be the bare name, so it is
+            // resolved through PATH. Passing "C:\CC\claude.exe" would bypass PATH
+            // entirely and make the verification meaningless.
+            Eq("claude", seenCmd, "launches the bare command name 'claude'");
+            Check(seenCmd.IndexOf("\\", StringComparison.Ordinal) < 0 &&
+                  seenCmd.IndexOf(":", StringComparison.Ordinal) < 0,
+                  "command name is not an absolute path");
+            Eq("--version", seenArgs, "passes --version");
+            Check(seenTimeout > 0, "a positive timeout is used");
+
+            // The new PATH (install dir first) must be handed to the child.
+            Check(seenPath != null && seenPath.StartsWith("C:\\CC", StringComparison.Ordinal),
+                  "the new PATH begins with the install dir");
+            Check(Util.PathContains(seenPath, "C:\\CC"), "the new PATH contains the install dir");
+
+            // The work dir must NOT be the install dir, otherwise the command could be
+            // found via the current directory and bypass PATH again.
+            Check(seenWorkDir == null || seenWorkDir.IndexOf("C:\\CC", StringComparison.Ordinal) < 0,
+                  "working dir is neutral (not the install dir)");
+
+            // Crucial: the current process environment must be left untouched.
+            Eq(beforePath, Environment.GetEnvironmentVariable("PATH"),
+               "current process PATH is not modified");
+
+            EqInt(0, r.VerifyFailures.Count, "expected version output -> no verification failures");
+            EqInt(1, r.VerifyLines.Count, "one verification line is recorded");
+        }
+
+        private static void Test_VerifyLaunchViaPath_ReportsFailure()
+        {
+            // Non-zero exit code (e.g. PATH did not resolve) -> must be recorded as a failure.
+            InstallResult r1 = new InstallResult();
+            PathRunner fail = delegate(string command, string args, string workDir,
+                                       int timeoutMs, string pathOverride, out string output)
+            {
+                output = "'claude' is not recognized as an internal or external command";
+                return 1;
+            };
+            InstallerCore.VerifyLaunchViaPath("C:\\CC", r1, fail);
+            EqInt(1, r1.VerifyFailures.Count, "non-zero exit code is recorded as a failure");
+
+            // Zero exit but unexpected output -> also a failure.
+            InstallResult r2 = new InstallResult();
+            PathRunner wrongVer = delegate(string command, string args, string workDir,
+                                           int timeoutMs, string pathOverride, out string output)
+            {
+                output = "0.0.0-not-the-expected-version";
+                return 0;
+            };
+            InstallerCore.VerifyLaunchViaPath("C:\\CC", r2, wrongVer);
+            EqInt(1, r2.VerifyFailures.Count, "unexpected version output is recorded as a failure");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -516,6 +596,9 @@ namespace ClaudeCodeSetup
             Run("ShouldRemoveGitBashEnv_ManifestOwnership", Test_ShouldRemoveGitBashEnv_ManifestOwnership);
             Run("PathIsUnder", Test_PathIsUnder);
             Run("ReadGitBashManifest", Test_ReadGitBashManifest);
+
+            Run("VerifyLaunchViaPath_UsesBareNameOnPath", Test_VerifyLaunchViaPath_UsesBareNameOnPath);
+            Run("VerifyLaunchViaPath_ReportsFailure", Test_VerifyLaunchViaPath_ReportsFailure);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);

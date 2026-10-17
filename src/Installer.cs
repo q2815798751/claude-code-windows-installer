@@ -36,6 +36,15 @@ namespace ClaudeCodeSetup
         internal long InstalledBytes;
     }
 
+    /// <summary>
+    /// 「按 PATH 执行一个命令」的可注入执行器（AW-2）。
+    /// 契约：command 必须是**裸命令名**（交给 PATH 解析），而不是绝对路径；
+    /// pathOverride 非空时只覆盖**子进程**的 PATH（临时进程环境），不污染当前进程。
+    /// 可注入是为了让单测能断言「实际传给系统的是裸命令名而非绝对路径」。
+    /// </summary>
+    internal delegate int PathRunner(string command, string args, string workDir,
+                                     int timeoutMs, string pathOverride, out string output);
+
     internal static class InstallerCore
     {
         internal const string PayloadEntry = "claude.exe";
@@ -283,21 +292,8 @@ namespace ClaudeCodeSetup
                 else if (count != 1) r.VerifyFailures.Add("用户 PATH 存在重复项");
             }
 
-            // 3) 用新 PATH 实际跑一次
-            string oldPath = Environment.GetEnvironmentVariable("PATH");
-            try
-            {
-                Environment.SetEnvironmentVariable("PATH", dir + ";" + oldPath);
-                string outp;
-                int code = RunCapture(exe, "--version", dir, 60000, out outp);
-                bool ok = code == 0 && outp.IndexOf(BuildInfo.ReleaseVersion, StringComparison.Ordinal) >= 0;
-                r.VerifyLines.Add(Fmt(ok, "启动测试 claude --version", OneLine(outp)));
-                if (!ok) r.VerifyFailures.Add("claude --version 输出异常");
-            }
-            finally
-            {
-                Environment.SetEnvironmentVariable("PATH", oldPath);
-            }
+            // 3) 用新 PATH 实际跑一次（走 PATH 解析，而不是绝对路径 —— AW-2）
+            VerifyLaunchViaPath(dir, r, RunViaPath);
 
             // 4) 快捷方式
             string[] links = new string[]
@@ -366,6 +362,52 @@ namespace ClaudeCodeSetup
             }
 
             if (progress != null) progress(100, "验证完成");
+        }
+
+        /// <summary>
+        /// AW-2：用**新 PATH** 实际启动一次 `claude --version`，验证 PATH 生效链路。
+        ///
+        /// 契约（旧实现违反之处）：命令名必须传**裸名** "claude"（交给 PATH 解析），
+        /// 而不是 `dir\claude.exe` 的绝对路径 —— 传绝对路径时这个验证根本不经过 PATH，
+        /// 是假验证（README / PLAN 宣称的「用新 PATH 实际启动」从未被真正验证）。
+        ///
+        /// 新 PATH 只注入临时子进程环境（runner 的 pathOverride），不动当前进程/系统。
+        /// 工作目录刻意用中性目录：若用安装目录，命令可能被「当前目录」直接命中而绕过
+        /// PATH（cmd 默认会搜当前目录），那样又变成假验证。
+        /// </summary>
+        internal static void VerifyLaunchViaPath(string dir, InstallResult r, PathRunner runner)
+        {
+            string oldPath = Environment.GetEnvironmentVariable("PATH");
+            if (oldPath == null) oldPath = "";
+            string newPath = Util.PrependPath(oldPath, dir);
+
+            // 中性工作目录：不含 claude.exe，确保命令只能靠 PATH 解析到。
+            string workDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (string.IsNullOrEmpty(workDir)) workDir = Path.GetTempPath();
+
+            string outp;
+            int code = runner("claude", "--version", workDir, 60000, newPath, out outp);
+            bool ok = code == 0 && outp != null &&
+                      outp.IndexOf(BuildInfo.ReleaseVersion, StringComparison.Ordinal) >= 0;
+            r.VerifyLines.Add(Fmt(ok, "启动测试 claude --version", OneLine(outp)));
+            if (!ok) r.VerifyFailures.Add("claude --version 输出异常");
+        }
+
+        /// <summary>
+        /// 真正按 PATH 执行：借 `cmd.exe /c` 让子进程按 pathOverride 里的 PATH 解析裸命令名。
+        ///
+        /// 为什么不能直接 Process.Start("claude", …) 配 EnvironmentVariables["PATH"]？
+        /// CreateProcess 解析裸命令名用的是**调用进程**的 PATH，对子进程环境块里的 PATH
+        /// 覆盖无效 —— 本机实测直接传裸名会「系统找不到指定的文件」。cmd.exe 则按自身
+        /// 环境里的 PATH 解析，因此既能真正走 PATH，又不污染当前进程。
+        /// </summary>
+        internal static int RunViaPath(string command, string args, string workDir,
+                                       int timeoutMs, string pathOverride, out string output)
+        {
+            string cmdExe = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe");
+            return RunCapture(cmdExe, "/c " + command + " " + args, workDir, timeoutMs,
+                              pathOverride, out output);
         }
 
         // ─────────────────────────────────────────────────────────
@@ -912,6 +954,16 @@ namespace ClaudeCodeSetup
 
         internal static int RunCapture(string exe, string args, string workDir, int timeoutMs, out string output)
         {
+            return RunCapture(exe, args, workDir, timeoutMs, null, out output);
+        }
+
+        /// <summary>
+        /// 与上面同，但 pathOverride 非空时只覆盖**子进程**的 PATH（临时进程环境），
+        /// 当前进程的环境不受影响（AW-2）。
+        /// </summary>
+        internal static int RunCapture(string exe, string args, string workDir, int timeoutMs,
+                                       string pathOverride, out string output)
+        {
             output = "";
             try
             {
@@ -921,6 +973,8 @@ namespace ClaudeCodeSetup
                 psi.RedirectStandardError = true;
                 psi.CreateNoWindow = true;
                 psi.WorkingDirectory = workDir;
+                // 只改子进程的环境块，绝不碰当前进程的环境变量。
+                if (pathOverride != null) psi.EnvironmentVariables["PATH"] = pathOverride;
 
                 StringBuilder sb = new StringBuilder();
                 using (Process p = new Process())
