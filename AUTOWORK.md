@@ -721,7 +721,7 @@
         （`LC_ALL=C grep -c '[^ -~]'` = 0）；显式 `ls` 确认 `src\BuildInfo.cs` 仍在
         （858 字节、mtime 未变，未被 stub 污染）。**无卡点**。
 
-- [ ] **AW-11 给空 catch 块补最小可观测性（健壮性，需限定范围）**
+- [x] **AW-11 给空 catch 块补最小可观测性（健壮性，需限定范围）**
       问题：全仓有 **38 处空 catch**（`src\Common.cs:376,397,417,520,646-647`、
       `src\Installer.cs:215,234,334,394,405,497,505-510`、`src\Program.cs:45,254,265`、
       `src\MainForm.cs:369,513,564` 等）。多数是刻意的防御式编程，
@@ -731,6 +731,55 @@
       改为至少记一条日志（项目有 `install.log` 机制）或返回失败状态。
       其余位置的 catch 保持不动，在「待确认」区登记「是否要全面加日志」。
       新增用例：模拟这些失败路径 → 断言失败被记录/被返回，而不是无声无息。
+      **结果（2026-10-17）**：完成（commit 7784711）。
+      - **范围（只动 `src\Installer.cs`，只动「删文件 / 删环境变量 / manifest」这三类的 catch）**：
+        改动的站点（按函数）——
+        ① `CleanStaleTempZip`（ARM64 临时 zip 清理）；
+        ② 安装 `finally` 里删除 ARM64 临时 zip；
+        ③ **卸载删环境变量**（`Uninstall` 里 CLAUDE_CODE_GIT_BASH_PATH 那段，旧空 catch）★核心；
+        ④ 卸载删空的开始菜单目录；
+        ⑤ `AtomicPlace` 清旧 `.old` + 落盘失败还原 `.old`（两处）；
+        ⑥ `CommitBackup`（提交时删 `.old`）；⑦ `RestoreOverwriteBackup`（两处）；
+        ⑧ `RollbackDir`；⑨ `Rollback` 辅助（6 处）；
+        ⑩ `ReadGitBashManifest`（manifest 读取）；⑪ `SafeDelete` / `DeleteIfExists`。
+        说明：`Installer.cs` 里**没有**「写 manifest」的 catch——`WriteManifest` 不吞异常，
+        写失败会一路抛到安装主 catch → `r.Ok=false`（已经是「返回失败状态」），故无可改。
+      - **做法（沿用仓库套路：可注入窄接口 + 纯函数单测）**：
+        新增 `TryDeleteFile` / `TryDeleteDir`（复用 AW-6 的 `IFileOps`，失败记日志并返回 false）、
+        可注入委托 `EnvVarRemover` + `DefaultEnvRemover` + `RemoveGitBashEnvIfOwned`
+        （复用 AW-1 的 `ShouldRemoveGitBashEnv` 判定归属，移除失败记日志并返回 false）；
+        `SafeDelete`/`DeleteIfExists` 改为走 `TryDeleteFile`（不再各自空 catch）。
+        `RollbackDir` 顺带**修正返回值**：旧实现删除失败也 `return true`，会让调用方谎报
+        「已删除目录」；现在失败返回 false，`Rollback` 也据此打印「删除失败，目录可能残留」。
+        其余站点把空 `catch { }` 改成 `catch (Exception ex) { Log.Write(...); }`（走 `install.log` 机制）。
+      - **未动（保持原样，登记待确认）**：`Installer.cs` 里**非这三类**的空 catch——
+        install.log 合并、`Verify` 读注册表、`LooksLikeClaudeHome` 探测、
+        `ReadUserPathRaw`/`ReadUserPathKind`、`RunCapture` 的 `p.Kill()`；
+        以及 `Common.cs`/`Program.cs`/`MainForm.cs`/`Checks.cs` 的全部 catch。
+        即「38 处」里除本项列出的站点外**全部未动**。
+      - **单测**（`tests\UnitTests.cs`，新增 12 用例 / 35 断言，含新 `ThrowingFileOps`——
+        可让指定的 `DeleteFile`/`DeleteDir`/`MoveFile` 抛异常，以及 `LoggedSince` 断言「新日志里出现某标记」）：
+        `TryDeleteFile_LogsOnFailure`、`TryDeleteDir_LogsOnFailure`、
+        `RemoveGitBashEnvIfOwned_RemovesOwnedValue`/`_LogsRemovalFailure`/`_KeepsUserValue`/`_Absent`、
+        `CommitBackup_LogsOnFailure`、`RestoreOverwriteBackup_LogsOnFailure`、
+        `RollbackDir_FreshInstallDeleteFails_ReportsNotDeleted`、
+        `AtomicPlace_RestoreFails_LogsBoth`、`ReadGitBashManifest_LogsOnReadFailure`
+        （用 `FileShare.None` 锁住 manifest 让 `File.ReadAllText` 确定性地抛 IOException）、
+        `CleanStaleTempZip_LogsOnFailure`。测试文件保持 ASCII-only（`LC_ALL=C grep -c '[^ -~]'` = 0）。
+        `build\unit.bat` **62 用例 / 178 断言全绿，退出码 0**（AW-10 为 50/143）。
+      - **撤掉修复确认变红（定点破坏，两轮，每轮先确认回退生效）**：
+        ① **删环境变量失败路径**：把 `RemoveGitBashEnvIfOwned` 的失败分支从
+        `catch (Exception ex) { Log.Write(...); return false; }` 改回旧的 `catch { return true; }`
+        （复现「静默吞掉、还报成功」），`grep` 确认工作树那行确实是 `catch { return true; }` 后重跑 →
+        **`RemoveGitBashEnvIfOwned_LogsRemovalFailure` 2 个断言变红、退出码 1**；
+        还原后 `grep` 计数为 0、重跑 **178/178 全绿**。
+        ② **删文件记日志**：把 `TryDeleteFile` 的失败分支改回 `catch { return false; }`（静默），
+        `sed` 确认工作树该行已生效后重跑 → **`TryDeleteFile_LogsOnFailure` 1 个断言变红、退出码 1**；
+        还原后 `grep` 计数为 0、重跑 **178/178 全绿**（先确认回退生效再取信）。
+      - **红线**：本项只跑 `unit.bat`（它编译全部产品源码 = 全项目编译检查），**未跑 E2E、
+        未触碰 `HKCU\Environment`**（无 `%TEMP%` 残留，测试全程用内存假文件系统 + 进程内注入委托）；
+        未引入任何第三方依赖；源码保持 C# 5（委托 + 纯函数/`out`，无新语法）；
+        显式 `ls` 确认 `src\BuildInfo.cs` 仍在（858 字节、mtime 未变，未被 stub 污染）。**无卡点**。
 
 - [ ] **AW-12 加 CI（打磨）**
       问题：没有 `.github/workflows/`，改动没有任何自动把关。
@@ -751,7 +800,12 @@
   （兑现代码注释的契约）。如果你其实想要「卸载就删干净」，那是另一个契约，说一声。
   另：若用户**安装前**已自配该变量、被安装器覆盖，卸载会按契约删除（用户原值丢失）。
   要不要改成「安装时记录用户原值、卸载时还原」？属产品决策，等拍板。
-- **38 处空 catch 要不要全面加日志？** AW-11 只做了安装/卸载主链路。
+- **38 处空 catch 要不要全面加日志？** AW-11 只做了 `Installer.cs` 里与「删文件 / 删环境变量 /
+  manifest」相关的那些（见 AW-11 结果列出的站点），其余全部保持不动。仍待拍板的是：
+  要不要给**其余**的空 catch 也全面加日志——`Installer.cs` 的 install.log 合并 / `Verify` 读注册表 /
+  `LooksLikeClaudeHome` 探测 / `ReadUserPathRaw`·`ReadUserPathKind` / `RunCapture` 的 `p.Kill()`，
+  以及 `Common.cs`（网络/注册表/Git 探测等）、`Program.cs`、`MainForm.cs`、`Checks.cs` 里的全部。
+  这些多为刻意的防御式探测，加日志的收益（可诊断性）与噪音需权衡，属产品决策。
 - **要不要把 E2E 加进 CI？** AW-12 明确没加，理由是写盘量与网络依赖。
 - **`docs/PLAN.md` 是活文档还是历史存档？** —— **AW-8 已判定为「活文档/设计规格」并据此
   逐条改文档对齐代码**（理由见 AW-8 结果：§7/§8 是实现后追加、且 AW-2/AW-3 把它当权威引用）。
