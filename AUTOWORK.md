@@ -671,7 +671,7 @@
       - **红线**：本项**纯文档改动**，未跑 E2E、未触碰 `HKCU\Environment`；未引入任何依赖；
         未碰 `main`、未 force push。**无卡点**。
 
-- [ ] **AW-10 修 ARM64 下载分支的临时文件泄漏（健壮性）**
+- [x] **AW-10 修 ARM64 下载分支的临时文件泄漏（健壮性）**
       问题：`src\Installer.cs:83-84`、`234` 把 ARM64 载荷下载到 `%TEMP%`，
       仅在 `finally` 里删除；进程被杀（用户取消、任务管理器结束、断电）就残留约 **96 MB** 临时文件。
       修法：用可预测的固定文件名 + **启动时清理上一轮残留**（在下载前先删同名旧文件），
@@ -679,6 +679,47 @@
       注意 C# 5 + .NET Framework 4.x 的可用 API 范围。
       新增用例：把「临时文件命名/清理」抽成可测的纯逻辑，断言命名可预测、
       且「下载前清理旧文件」这条路径被走到。
+      **结果（2026-10-17）**：完成（commit 845f305）。
+      - **现状定位（行号按当前文件）**：旧实现 `src\Installer.cs:123-124` 把 ARM64 载荷下载到
+        `%TEMP%\claude-arm64-<随机8位>.zip`（`Guid.NewGuid()` 取名），且**只在 `finally`**
+        （旧 `:286`）删除。`finally` 只在**正常退出**时运行——用户取消 / 任务管理器结束 /
+        断电时不会执行，约 96 MB 残留；而**随机名**意味着下一轮安装**无法定位**它，残留永远无人回收。
+      - **选的机制：可预测的固定文件名 + 下载前清理上一轮残留**（而非 `DeleteOnClose`）。
+        理由（写进代码注释）：`DeleteOnClose` 只在**文件句柄关闭**时删除，而下载
+        （`Net.DownloadFile` 按**路径**写）与解压（`ZipFile.OpenRead` **二次打开**）分属不同句柄；
+        要让「崩溃后回收」成立就得让该句柄活到解压结束，改动面远大于固定名 + 预清理，且
+        `FileShare` 语义会让二次打开失败。固定名 + 下载前清理改动小、可测，且与仓库既有套路一致。
+      - **命名/清理规则**：固定名 `claude-arm64-payload.zip`（常量 `Arm64TempZipName`，不含随机数）；
+        路径由纯函数 `Arm64TempZipPath(tempDir)` 计算。安装进入 ARM64 分支、**下载之前**调
+        `PrepareArm64TempZip(Path.GetTempPath(), new RealFileOps())`：先算固定路径、再
+        `CleanStaleTempZip` 删同名旧文件（存在则删、返回 true），然后才交给 `Net.DownloadFile` 写。
+        正常路径仍由 `finally` 删除，两条路径互补。
+      - **实现**（`src\Installer.cs`，C# 5）：新增常量 `Arm64TempZipName` + 三个纯函数/窄逻辑
+        `Arm64TempZipPath` / `CleanStaleTempZip(path, IFileOps)` / `PrepareArm64TempZip(tempDir, IFileOps)`；
+        复用 AW-6 已有的窄接口 `IFileOps`（注入 `FakeFileOps` 即可在内存里驱动，**不真下载 96 MB**）；
+        ARM64 分支改用 `PrepareArm64TempZip` 并记一行日志。无新语法（无插值 / `?.` / 表达式体）。
+      - **单测**（`tests\UnitTests.cs`，新增 3 用例 / 9 断言，全部用注入的 `FakeFileOps`，
+        **不碰真实 `%TEMP%`、不下载任何字节**，测试文件保持 ASCII-only）：
+        `Arm64TempZipPath_Predictable`（两次调用结果相同＝无随机 GUID；等于
+        `C:\Temp\claude-arm64-payload.zip`；以 `.zip` 结尾；文件名与 tempDir 无关）、
+        `CleanStaleTempZip`（无残留→返回 false；有残留→返回 true 且文件消失）、
+        `PrepareArm64TempZip_CleansLeftover`（在固定路径放一个「上一轮被杀残留」→ 调生产函数后
+        断言返回固定路径、且**残留已被删除**——即「下载前清理旧文件」这条路径被**生产代码**走到）。
+        `build\unit.bat` **50 用例 / 143 断言全绿，退出码 0**（AW-9 为 47/134）。
+      - **撤掉修复确认变红（定点破坏，两轮，每轮先确认回退生效）**：
+        ① **命名回归**：把 `Arm64TempZipPath` 改回旧的随机 GUID 名（复现原 bug），
+        `grep` 确认工作树那行确含 `Guid.NewGuid()...".zip"` 后重跑 →
+        **5 个断言变红（`Arm64TempZipPath_Predictable` 3 条 + `PrepareArm64TempZip_CleansLeftover`
+        2 条）、退出码 1**；还原后 `grep` 确认已无 GUID、重跑 **143/143 全绿**。
+        ② **清理路径回归**：把 `PrepareArm64TempZip` 里的 `CleanStaleTempZip(path, fs);`
+        调用删掉（复现「下载前不清理」），`sed` 确认工作树该行已消失后重跑 →
+        **`PrepareArm64TempZip_CleansLeftover` 1 断言变红、退出码 1**；还原后 `sed` 确认该行已回、
+        重跑 **143/143 全绿**（先确认回退生效再取信）。
+      - **红线**：本项只跑 `unit.bat`（它编译全部产品源码 = 全项目编译检查），**未跑 E2E、
+        未触碰 `HKCU\Environment`**（无 `%TEMP%` 残留，测试全程用内存假文件系统）；
+        未引入任何第三方依赖；源码保持 C# 5；`tests\UnitTests.cs` ASCII-only
+        （`LC_ALL=C grep -c '[^ -~]'` = 0）；显式 `ls` 确认 `src\BuildInfo.cs` 仍在
+        （858 字节、mtime 未变，未被 stub 污染）。**无卡点**。
 
 - [ ] **AW-11 给空 catch 块补最小可观测性（健壮性，需限定范围）**
       问题：全仓有 **38 处空 catch**（`src\Common.cs:376,397,417,520,646-647`、
