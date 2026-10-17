@@ -30,11 +30,11 @@
 | PowerShell | ✅ 5.1 |
 | IExpress | ✅ 备用打包方案 |
 | NSIS / Inno Setup / 7-Zip | ❌ 未安装 → 不依赖 |
-| Git for Windows | ✅ 2.45.1 @ `E:\Git`（bash: `E:\Git\bin\bash.exe`） |
+| Git for Windows | ✅ 2.45.1 @ `<Git 安装目录>`（bash: `<Git 安装目录>\bin\bash.exe`） |
 | Windows Terminal | ✅ `wt.exe` 存在 |
 | 系统 | Windows 10 Pro 22H2 build 19045，AMD64 |
 | LongPathsEnabled | ❌ 0（未启用） |
-| C: 可用空间 | 347 GB |
+| C: 可用空间 | 充足（满足安装所需） |
 
 **关键技术决策**：不引入任何第三方打包工具，用 .NET Framework 内置 `csc.exe` 手写
 WinForms 安装器，把官方载荷 zip 以「尾部追加 + trailer」方式合成单文件 exe。
