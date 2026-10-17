@@ -69,10 +69,23 @@ echo ----- Phase 2: uninstall from sandbox -----
 set "RC=%ERRORLEVEL%"
 echo    exit code: %RC%
 
-rem The exe under test lives outside the sandbox, so the uninstaller's
-rem deferred self-delete is not involved here - expect the dir gone.
+rem The exe under test lives OUTSIDE the sandbox, so the uninstaller never has
+rem to defer because of its own running image. But it still defers whenever ANY
+rem handle transiently blocks the delete - InstallerCore.Uninstall falls back to
+rem ScheduleDelete (a detached cmd that waits ~3s then rd /s /q) - for example
+rem antivirus scanning the freshly written 221 MB claude.exe, or a handle not
+rem yet released. That deferred delete fires a few seconds after uninstall
+rem returns, so the removal is ASYNCHRONOUS.
+rem Therefore poll with a bounded timeout instead of checking once: a transient
+rem lock passes (the dir does disappear), while a genuine failure - the file is
+rem never removed - still fails after the timeout.
+for /L %%I in (1,1,30) do (
+  if not exist "%SANDBOX%\claude.exe" goto :claude_checked
+  ping -n 2 127.0.0.1 >nul 2>&1
+)
+:claude_checked
 if exist "%SANDBOX%\claude.exe" (
-  echo    FAIL claude.exe still present after uninstall
+  echo    FAIL claude.exe still present after uninstall ^(waited ~30s for the deferred delete^)
   set "FAILED=1"
 ) else (
   echo    OK   claude.exe removed
