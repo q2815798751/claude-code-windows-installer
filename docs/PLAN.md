@@ -2,6 +2,9 @@
 
 > 目标：一个 `ClaudeCodeSetup.exe`，在全新 Windows 电脑上双击即完成 Claude Code 安装、
 > 环境变量配置、桌面快捷启动，并在安装前做完整预检与用户确认。
+>
+> 说明：本文描述安装器的设计与行为规格，随实现演进更新；文中若与代码不一致，
+> 以 `src/` 下的实现为准。
 
 ---
 
@@ -59,8 +62,7 @@ ClaudeCodeSetup.exe
 
 ```
 %LOCALAPPDATA%\Programs\ClaudeCode\
-├── claude.exe                ← 官方原生二进制
-├── (官方 zip 内其余文件)
+├── claude.exe                ← 官方原生二进制（安装器只解出这一个文件）
 ├── Uninstall.exe             ← 卸载器
 ├── install.log               ← 安装日志（含所有预检结果）
 └── manifest.json             ← 版本 / SHA256 / 安装时间
@@ -84,7 +86,7 @@ ClaudeCodeSetup.exe
 |---|---|---|---|
 | 1 | 操作系统 | Win10 1809+（build ≥ 17763）/ Win11 | 阻断，提示不支持 |
 | 2 | CPU 架构 | x64 → 用内置载荷；arm64 → 走在线下载 | arm64 无网则阻断 |
-| 3 | 可用磁盘 | 目标卷 ≥ 600 MB | 阻断 |
+| 3 | 可用磁盘 | 目标卷 ≥ 700 MB | 阻断 |
 | 4 | 网络连通 | TCP+TLS 握手 `api.anthropic.com`、`github.com`，测 RTT 与吞吐 | **仅警告**（内置载荷可离线装）；arm64 下载路径则阻断 |
 | 5 | Git for Windows | 存在且 `bash.exe` 可达 | 警告 + 提供下载入口；同时写入 `CLAUDE_CODE_GIT_BASH_PATH` |
 | 6 | 已有安装 | 扫 PATH / npm 全局 / 旧版原生目录 | 提供 升级 / 修复 / 取消 |
@@ -130,11 +132,11 @@ ClaudeCodeSetup.exe
 ## 4. 构建流程
 
 ```
-build/
+src/
 ├── Installer.cs          # WinForms 安装器（C# 5）
-├── Uninstaller.cs        # 卸载器（C# 5）
-├── build.bat             # 一键构建：编译 stub → 合成带载荷的 exe → 校验
-└── langtest.bat          # C#5 能力自检（已保留）
+└── Uninstaller.cs        # 卸载器（C# 5）
+build/
+└── build.bat             # 一键构建：编译 stub → 合成带载荷的 exe → 校验
 ```
 
 `build.bat` 步骤：
