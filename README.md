@@ -198,13 +198,24 @@ build\unit.bat            :: 全部通过退出码 0，任一断言失败退出�
 现在仅当该变量确由本安装器写入、且值未被改动时才移除；护栏仍然值得保留。）
 
 ```cmd
-build\e2e-with-backup.bat         :: 先备份 HKCU\Environment，跑 E2E，再比对/必要时恢复
-build\e2e-with-backup.bat /full   :: 额外测试 ARM64 在线下载分支
+build\e2e-with-backup.bat             :: 先备份 HKCU\Environment，跑 E2E，再比对/必要时恢复
+build\e2e-with-backup.bat /full       :: 额外测试 ARM64 在线下载分支
+build\e2e-with-backup.bat --keep-backup  :: 跑完保留备份文件（见下面的凭据警告）
 ```
 
 包装脚本会先 `reg export` 备份 `HKCU\Environment`，跑完再导出一份做逐字节比对；
 若发现被改动就用备份 `reg import` 恢复并复验，最后把「环境是否被改动」作为结论行打印
 （`UNCHANGED` / `CHANGED-RESTORED` 等）。退出码透传 `build\test.bat` 的结果。
+
+> **凭据安全**：`HKCU\Environment` 里存有**明文**密钥（例如 `ANTHROPIC_AUTH_TOKEN`），
+> 所以备份文件本身就是一个明文凭据文件。**默认情况下备份只在运行期间存在，跑完立即删除**；
+> 只有显式传 `--keep-backup` 才会保留，保留时会打印明文凭据警告并列出该文件里含哪些
+> 敏感值名。**不要提交、复制或分享**该文件，用完请立即删除。
+>
+> 「环境有没有变」这个判断不依赖保留的明文：每次 `reg export` 之后会另存一份
+> **「值名 + 值 sha256」清单**（`build\env-hash.ps1` 生成，盘上不含明文），
+> 两份清单也会一起比对；`.reg` 之间仍然做逐字节 `fc /b` 比对，恢复也仍然由 `reg import`
+> 完成——这些安全保证没有改变。
 
 > 构建脚本刻意保持纯 ASCII：cmd.exe 会破坏非 ASCII 批处理文件，Windows
 > PowerShell 5.1 也会误解无 BOM 的 UTF-8 脚本。中文只出现在 `.cs` 源文件中，
@@ -229,6 +240,7 @@ build\e2e-with-backup.bat /full   :: 额外测试 ARM64 在线下载分支
 │   ├── fetch-payload.ps1   拉取官方载荷
 │   ├── test.bat            端到端测试（会真的安装/卸载）
 │   ├── e2e-with-backup.bat test.bat 的环境护栏包装（备份/比对/恢复 HKCU\Environment）
+│   ├── env-hash.ps1        把 reg 导出转成「值名 + sha256」清单（不含明文）
 │   └── unit.bat            零依赖 C# 单元测试（编译并运行 tests\UnitTests.cs）
 ├── tests/
 │   └── UnitTests.cs        自研 assert 式单元测试
