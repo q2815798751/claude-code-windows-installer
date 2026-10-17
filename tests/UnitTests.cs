@@ -664,6 +664,96 @@ namespace ClaudeCodeSetup
                   "unknown arch still warns and assumes x64");
         }
 
+        // ---- AW-5: Program.ParseUninstallArgs / UnknownArgs ----------------
+        //
+        // build\test.bat:68 passed --keep-config, but Program.cs only knew
+        // --delete-config (keeping is the default), so the switch was silently
+        // ignored - the test script only LOOKED like it explicitly kept the
+        // config. The fix makes --keep-config a first-class switch (idempotent)
+        // and warns about unknown switches instead of swallowing them.
+        //
+        // Note: keeping is the default, so "--keep-config -> kept" on its own is
+        // NOT a discriminating assertion. What the fix actually changes is that
+        // --keep-config is now RECOGNISED: it is no longer an unknown switch, and
+        // it overrides an earlier --delete-config (last switch wins). Both of
+        // those are asserted below so the fix cannot silently regress.
+        private static void Test_ParseUninstallArgs_KeepConfig()
+        {
+            Program.UninstallArgs keep = Program.ParseUninstallArgs(
+                new string[] { "--silent-uninstall", "--keep-config" });
+            Check(keep.KeepConfig, "--keep-config keeps the user config");
+
+            // No switch at all is the documented default and also keeps.
+            Program.UninstallArgs none = Program.ParseUninstallArgs(
+                new string[] { "--silent-uninstall" });
+            Check(none.KeepConfig, "no config switch defaults to keeping");
+        }
+
+        private static void Test_ParseUninstallArgs_DeleteConfig()
+        {
+            Program.UninstallArgs del = Program.ParseUninstallArgs(
+                new string[] { "--silent-uninstall", "--delete-config" });
+            Check(!del.KeepConfig, "--delete-config deletes the user config");
+        }
+
+        private static void Test_ParseUninstallArgs_ExplicitKeepOverrides()
+        {
+            // --keep-config is a real switch, not a no-op: given after
+            // --delete-config it flips the decision back to keep (last wins).
+            // Before the fix --delete-config won unconditionally, so this is the
+            // assertion that actually distinguishes fixed from broken.
+            Program.UninstallArgs k = Program.ParseUninstallArgs(
+                new string[] { "--delete-config", "--keep-config" });
+            Check(k.KeepConfig, "--keep-config after --delete-config wins (explicit, idempotent)");
+
+            Program.UninstallArgs d = Program.ParseUninstallArgs(
+                new string[] { "--keep-config", "--delete-config" });
+            Check(!d.KeepConfig, "--delete-config after --keep-config wins (last switch wins)");
+        }
+
+        private static void Test_ParseUninstallArgs_TargetDir()
+        {
+            Program.UninstallArgs a = Program.ParseUninstallArgs(
+                new string[] { "--target-dir=\"C:\\sandbox\"", "--delete-config" });
+            Eq("C:\\sandbox", a.TargetDir, "--target-dir= value is extracted and unquoted");
+            Check(!a.KeepConfig, "other switches are parsed alongside --target-dir");
+        }
+
+        private static void Test_UnknownArgs_RecognisesRealCommandLine()
+        {
+            // The exact uninstall command line build\test.bat:68 issues. Every
+            // switch must be recognised - in particular --keep-config, which is
+            // the whole point of AW-5. If --keep-config were dropped from the
+            // known set, this test goes red.
+            List<string> u = Program.UnknownArgs(
+                new string[] { "--silent-uninstall", "--target-dir=\"C:\\sandbox\"",
+                               "--keep-config", "--report=\"C:\\out\\phase2.txt\"" },
+                Program.UninstallFlags, Program.UninstallPrefixes);
+            EqInt(0, u.Count, "test.bat uninstall command line has no unknown switches");
+        }
+
+        private static void Test_UnknownArgs_FlagsTypos()
+        {
+            // A misspelled switch must be reported, not silently swallowed - the
+            // regression guard for the whole class of bug AW-5 is about.
+            List<string> u = Program.UnknownArgs(
+                new string[] { "--keep-confgi" },
+                Program.UninstallFlags, Program.UninstallPrefixes);
+            EqInt(1, u.Count, "a misspelled switch is reported as unknown");
+            Eq("--keep-confgi", u[0], "the unknown switch is named in the report");
+
+            // Known switches of the other modes are not unknown in their own mode.
+            List<string> inst = Program.UnknownArgs(
+                new string[] { "--silent-install", "--no-system", "--force-download" },
+                Program.InstallFlags, Program.InstallPrefixes);
+            EqInt(0, inst.Count, "install-mode switches are recognised in install mode");
+
+            List<string> self = Program.UnknownArgs(
+                new string[] { "--selftest" },
+                Program.SelfTestFlags, Program.SelfTestPrefixes);
+            EqInt(0, self.Count, "selftest switch is recognised");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -717,6 +807,13 @@ namespace ClaudeCodeSetup
             Run("CheckExisting_AdviceSaysPrepend", Test_CheckExisting_AdviceSaysPrepend);
 
             Run("ArchVerdict_X86Rejected", Test_ArchVerdict_X86Rejected);
+
+            Run("ParseUninstallArgs_KeepConfig", Test_ParseUninstallArgs_KeepConfig);
+            Run("ParseUninstallArgs_DeleteConfig", Test_ParseUninstallArgs_DeleteConfig);
+            Run("ParseUninstallArgs_ExplicitKeepOverrides", Test_ParseUninstallArgs_ExplicitKeepOverrides);
+            Run("ParseUninstallArgs_TargetDir", Test_ParseUninstallArgs_TargetDir);
+            Run("UnknownArgs_RecognisesRealCommandLine", Test_UnknownArgs_RecognisesRealCommandLine);
+            Run("UnknownArgs_FlagsTypos", Test_UnknownArgs_FlagsTypos);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);

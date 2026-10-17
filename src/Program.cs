@@ -45,6 +45,12 @@ namespace ClaudeCodeSetup
                 catch { }
                 try { Console.OutputEncoding = Encoding.UTF8; } catch { }
 
+                // 未知开关不再被静默忽略：写一行警告，避免 --keep-config 这类
+                // 笔误（或曾经被悄悄忽略的开关）无声消失（见 AW-5）。
+                if (sUninst)      WarnUnknownArgs(args, UninstallFlags, UninstallPrefixes);
+                else if (sInstall) WarnUnknownArgs(args, InstallFlags, InstallPrefixes);
+                else               WarnUnknownArgs(args, SelfTestFlags, SelfTestPrefixes);
+
                 int code;
                 if (sUninst)     code = RunSilentUninstall(args);
                 else if (sInstall) code = RunSilentInstall(selfPath, args);
@@ -191,12 +197,12 @@ namespace ClaudeCodeSetup
         private static int RunSilentUninstall(string[] args)
         {
             Out("===== 静默卸载 =====");
-            // 默认保留 ~/.claude；要删除必须显式传 --delete-config
-            bool keep = !HasFlag(args, "--delete-config");
-            Out(keep ? "保留用户配置 ~/.claude" : "警告：将删除用户配置 ~/.claude");
+            // 默认保留 ~/.claude；--delete-config 请求删除，--keep-config 只是把
+            // 「保留」显式化（幂等）。两者都给时以命令行中最后出现的那个为准（见 AW-5）。
+            UninstallArgs ua = ParseUninstallArgs(args);
+            Out(ua.KeepConfig ? "保留用户配置 ~/.claude" : "警告：将删除用户配置 ~/.claude");
             string err;
-            string target = ArgValue(args, "--target-dir=");
-            bool ok = InstallerCore.Uninstall(target, null, keep, out err);
+            bool ok = InstallerCore.Uninstall(ua.TargetDir, null, ua.KeepConfig, out err);
             Out(ok ? "卸载完成。" : "卸载失败: " + err);
             Flush();
             return ok ? 0 : 5;
@@ -225,6 +231,86 @@ namespace ClaudeCodeSetup
                     return args[i].Substring(prefix.Length).Trim('"');
             }
             return null;
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // 静默命令行参数解析（纯函数，便于单测；见 AW-5）
+        // ─────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// 静默卸载的解析结果。保留 ~/.claude 是默认行为；<c>--keep-config</c>
+        /// 只是把它显式化（幂等），<c>--delete-config</c> 才请求删除。
+        /// 两者都给时以命令行中最后出现的那个为准。
+        /// </summary>
+        internal struct UninstallArgs
+        {
+            public bool KeepConfig;  // true = 保留用户配置 ~/.claude
+            public string TargetDir; // --target-dir= 的值；未给出时为 null
+        }
+
+        /// <summary>
+        /// 解析 <c>--silent-uninstall</c> 的开关。纯函数、无副作用，
+        /// 因此 keep/delete 的判定可以在单测里直接断言，不必真的跑卸载器。
+        /// </summary>
+        internal static UninstallArgs ParseUninstallArgs(string[] args)
+        {
+            UninstallArgs o = new UninstallArgs();
+            o.KeepConfig = true; // 默认：保留
+            o.TargetDir = null;
+            bool targetSet = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (string.Equals(a, "--delete-config", StringComparison.OrdinalIgnoreCase))
+                    o.KeepConfig = false;
+                else if (string.Equals(a, "--keep-config", StringComparison.OrdinalIgnoreCase))
+                    o.KeepConfig = true; // 显式保留（幂等；也可覆盖前面的 --delete-config）
+                else if (!targetSet && a.StartsWith("--target-dir=", StringComparison.OrdinalIgnoreCase))
+                {
+                    o.TargetDir = a.Substring("--target-dir=".Length).Trim('"');
+                    targetSet = true; // 与 ArgValue 一致：取第一个匹配
+                }
+            }
+            return o;
+        }
+
+        // 各静默模式的已知开关。--report= 在所有模式都已知（Main 顶部就会读它）。
+        internal static readonly string[] SelfTestFlags    = new string[] { "--selftest" };
+        internal static readonly string[] SelfTestPrefixes = new string[] { "--report=" };
+
+        internal static readonly string[] InstallFlags     = new string[] { "--silent-install", "--no-shortcuts", "--no-path", "--force-download", "--no-system" };
+        internal static readonly string[] InstallPrefixes  = new string[] { "--target-dir=", "--report=" };
+
+        internal static readonly string[] UninstallFlags    = new string[] { "--silent-uninstall", "--keep-config", "--delete-config" };
+        internal static readonly string[] UninstallPrefixes = new string[] { "--target-dir=", "--report=" };
+
+        /// <summary>
+        /// 纯函数：返回既不是已知开关、也不匹配任何已知前缀的参数。
+        /// 未知开关不应被静默忽略，否则 --keep-config 这类笔误会被吞掉。
+        /// </summary>
+        internal static List<string> UnknownArgs(string[] args, string[] flags, string[] prefixes)
+        {
+            List<string> unknown = new List<string>();
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                bool known = false;
+                for (int j = 0; j < flags.Length; j++)
+                    if (string.Equals(a, flags[j], StringComparison.OrdinalIgnoreCase)) { known = true; break; }
+                if (!known)
+                    for (int j = 0; j < prefixes.Length; j++)
+                        if (a.StartsWith(prefixes[j], StringComparison.OrdinalIgnoreCase)) { known = true; break; }
+                if (!known) unknown.Add(a);
+            }
+            return unknown;
+        }
+
+        /// <summary>把未知开关打一行警告（进控制台与 report），不再静默忽略。</summary>
+        private static void WarnUnknownArgs(string[] args, string[] flags, string[] prefixes)
+        {
+            List<string> unknown = UnknownArgs(args, flags, prefixes);
+            if (unknown.Count > 0)
+                Out("警告: 忽略无法识别的参数: " + string.Join(" ", unknown.ToArray()));
         }
 
         private static int _lastPct = -1;
