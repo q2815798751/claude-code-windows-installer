@@ -1,0 +1,57 @@
+# CI - on a clean windows-latest runner: compile every product source, run the
+# zero-dependency unit tests, build the installer and run its read-only
+# self-test.
+#
+# Deliberately NOT in CI:
+#   * build\test.bat (the real install/uninstall E2E) - it writes ~211 MB into a
+#     sandbox, depends on uninstall behaviour and has historically touched user
+#     environment variables. Risk/benefit does not fit CI. Run it locally via
+#     build\e2e-with-backup.bat instead.
+#   * No ARM64 payload download (~96 MB network fetch would be flaky).
+#   * No real x64 payload download either: build\ci-payload.ps1 creates a tiny
+#     synthetic payload so the whole build pipeline (prep -> compile -> pack ->
+#     trailer verify) and the installer's --selftest run for real, with no
+#     network dependency. Real payload integrity is still enforced by
+#     build\build.bat whenever the real payload is present (it refuses to build
+#     on a SHA256 mismatch against payload\SHASUMS256.txt).
+
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # unit.bat compiles every product source (Program/MainForm/Checks/
+      # Installer/Uninstaller/Common + the tests) and then runs them. In a fresh
+      # clone src\BuildInfo.cs is absent, so this also exercises the stub path
+      # fixed in AW-16 - CI is exactly the clean-clone case that used to fail.
+      - name: Unit tests (compiles every product source, then runs them)
+        shell: cmd
+        run: build\unit.bat
+
+      - name: Create synthetic CI payload
+        shell: cmd
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File build\ci-payload.ps1
+
+      - name: Build installer (csc + pack + trailer verify)
+        shell: cmd
+        run: build\build.bat
+
+      # --report= writes the full preflight output to a file; the installer is a
+      # winexe that attaches to the parent console, so piping its stdout is not
+      # reliable - printing the report file keeps the CI log useful. The step
+      # still fails on a non-zero exit code (a blocking preflight failure).
+      - name: Self-test the packed installer (read-only preflight)
+        shell: cmd
+        run: |
+          dist\ClaudeCodeSetup.exe --selftest --report=build\work\selftest.txt
+          if errorlevel 1 exit /b 1
+          type build\work\selftest.txt
