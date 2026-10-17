@@ -411,7 +411,7 @@
         源码保持 C# 5（纯函数 + 字符串拼接，无新语法）。
       - **无卡点**。
 
-- [ ] **AW-4 修 32 位 Windows 被误判为 x64（正确性）**
+- [x] **AW-4 修 32 位 Windows 被误判为 x64（正确性）**
       问题：`src\Checks.cs:228` 把 `"AMD64"` 与 `"X86"` 合并成同一分支，
       返回 Pass、`UseBundled=true`，文案「x64 — 使用内置载荷」。
       32 位 Win10（`PROCESSOR_ARCHITECTURE=X86`）会通过 OS 检查（build ≥ 17763）
@@ -421,6 +421,35 @@
       默认按**拒绝（Fail）**处理并在「待确认」区登记；如果你判断原设计有意允许，
       就记到待确认、不要擅自改。
       新增用例：`X86` → 断言不再返回 Pass；`AMD64` → 断言仍 Pass。
+      **结果（2026-10-17）**：完成（commit 0f753b9）。
+      - **契约**：32 位 Windows（`Util.NativeArch()` = `X86`）**明确拒绝安装**——
+        `ArchVerdict("X86")` 返回 `Fail`（阻断性失败，`HasBlockingFailure=true`），
+        GUI 里安装按钮被禁用（`MainForm.OnPreflightDone`）、静默安装返回 2
+        （`Program.RunSilentInstall` 见 `pre.HasBlockingFailure` 即中止）。内置载荷是
+        64 位 `claude.exe`，32 位装上必然到冒烟测试才失败，故拒绝比「警告后继续」更诚实。
+      - **可测性（AW-3 同款）**：`CheckArch` 依赖 `Util.NativeArch()`（读进程环境变量），
+        单测里无法确定性地驱动到每个分支——原实现**不可注入**。故把判定逻辑抽成
+        **可注入架构字符串的纯函数** `Preflight.ArchVerdict(string a, out bool useBundled)`
+        （返回 `CheckItem`），`CheckArch` 只负责取架构、回填 `res.Arch`/`res.UseBundled`，
+        行为不变。`X86` 从 `AMD64 || X86` 分支**拆成独立分支**。
+      - **实现**（`src\Checks.cs`，C# 5）：`ArchVerdict` 四分支——`AMD64`→Pass(useBundled=true)；
+        `X86`→**Fail**(useBundled=true)；`ARM64`→Info(useBundled=false)；其他/未知→Warn(useBundled=true)。
+        `X86` 的 `useBundled` 保持 `true` 只是沿用旧值：该状态是阻断性失败、安装不会继续；
+        取 `false` 反而会让网络预检误报「ARM64 需从 GitHub 下载」，故保持 `true`（代码有注释）。
+        `X86` 的 Detail=「32 位 Windows (X86) — 不受支持」，Advice 说明只提供 64 位版本。
+      - **单测**：新增 1 个用例 / 7 个断言 `ArchVerdict_X86Rejected`——`X86` 断言
+        `State != Pass`、`State == Fail`、有 Advice；`AMD64` 断言 `Pass` 且 `useBundled==true`；
+        另断言 `ARM64`→`Info`+非内置、未知架构→`Warn`+按 x64 处理（防回归）。
+        `build\unit.bat` **34 用例 / 93 断言全绿，退出码 0**（AW-3 为 33/86）。
+      - **撤掉修复确认变红（定点破坏）**：只把 `ArchVerdict` 里 `X86` 分支的
+        `c.State = CheckState.Fail` 改回 `CheckState.Pass`（复现原 bug，不碰其他任何改动），
+        `grep` 确认工作树那一行确实是 `Pass`（回退生效）后重跑 → **2 个断言变红、退出码 1**；
+        改回 `Fail` 后 `grep` 确认已恢复、重跑 **93/93 全绿**（先确认回退生效再取信）。
+      - **待确认**：本项按「拒绝（Fail）」实现，已在「待确认」区登记（原条目已存在，未新增）：
+        若安装器有意支持 32 位机器，应改为「警告 + 允许继续」。
+      - **红线**：本项只跑 `unit.bat`，**未跑 E2E、未触碰 `HKCU\Environment`**；
+        未引入任何第三方依赖；源码保持 C# 5（纯函数 + `out` 参数，无新语法）；
+        显式 `ls` 确认 `src\BuildInfo.cs` 仍在（未被 stub 污染）。**无卡点**。
 
 - [ ] **AW-5 修 `--keep-config` 无效开关（正确性，测试脚本的自欺）**
       问题：`build\test.bat:68` 传 `--keep-config`，但 `src\Program.cs:195` 只识别
