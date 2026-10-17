@@ -494,7 +494,7 @@
         残留）；未引入任何第三方依赖；源码保持 C# 5（struct + 纯函数，无新语法）；
         显式 `ls` 确认 `src\BuildInfo.cs` 仍在（858 字节，未被 stub 污染）。**无卡点**。
 
-- [ ] **AW-6 修「原子落盘」不原子 + Rollback 误删既有安装（健壮性）**
+- [x] **AW-6 修「原子落盘」不原子 + Rollback 误删既有安装（健壮性）**
       问题两处：
       (a) `src\Installer.cs:132-137` 先 `SafeDelete(exePath)` 再 `File.Move(tmpPath, exePath)`；
       `Move` 失败时**旧的 claude.exe 已经没了**，与 `README.md:71` 的「原子落盘」表述不符。
@@ -506,6 +506,51 @@
       ⚠️ 这两处改动风险较高，**先读完整上下文再动手**，并在条目里写清失败场景下用户会看到什么。
       新增用例：模拟 `Move` 失败 → 断言旧 exe 仍在；模拟覆盖安装中途失败 →
       断言原有安装未被删除。
+      **结果（2026-10-17）**：完成（commit cf17d59）。
+      - **契约 (a)**：落盘改为**先备份后落盘**——把已存在的旧 `claude.exe` 改名为
+        `claude.exe.old`，再把新产物 Move 到位；Move 失败时把 `.old` 改回原名，用户原有的
+        `claude.exe` **原样保留**。备份**不在落盘处删除**，而是保留到安装整体成功才提交删除
+        （`CommitBackup`），因此它同时是覆盖安装的事务回滚点（供 (b) 用）。
+      - **契约 (b)**：安装开始**之前**判定本次是否为「覆盖/修复安装」
+        （`IsOverwriteInstall`：安装前目录里已有 `claude.exe` 或 `manifest.json`），
+        结果一直传到回滚点。`Rollback` 改为调 `RollbackDir`：**全新安装**才删除安装目录；
+        **覆盖安装绝不整体删除**，而是把 `claude.exe.old` 还原回 `claude.exe`（撤销本次覆盖），
+        无备份则原样保留。另：失败但尚未写系统改动时（如步骤 5 冒烟测试失败，此时 `touchedSystem`
+        仍为 false）也还原 `.old`，避免留下残留。
+      - **失败场景下用户会看到什么**：
+        - (a) 覆盖安装时新产物落盘失败（如旧 exe 被占用/杀软扫描）：安装**报错退出**
+          （`安装失败: …` + 具体异常），但用户原有的 `claude.exe` **仍在原位、内容不变**，
+          命令行 `claude` 照常可用——不再出现「装到一半旧版也没了」的空窗。
+        - (b) 覆盖/修复安装中途失败：安装报错退出并**保留用户的既有安装目录**（含原有
+          `claude.exe`，若有备份则已还原），只回滚本安装器本次写的系统改动
+          （PATH / 快捷方式 / 卸载注册项）；日志打印「回滚完成：保留既有安装（覆盖安装，
+          未删除目录；已还原备份）」。全新安装失败则仍按旧行为删除本次创建的目录
+          （打印「回滚完成：已删除本次创建的安装目录」）。
+      - **可测性（AW-3/4/5 同款）**：抽出窄接口 `IFileOps`（`FileExists/DirExists/MoveFile/
+        DeleteFile/DeleteDir`，生产实现 `RealFileOps`），把「落盘失败」「覆盖回滚」这些
+        **只在异常路径发生**的分支变成可注入、可确定性驱动的逻辑（注入一个会让 Move 抛异常的假
+        fs 即可，不必真造磁盘故障）。核心逻辑抽成可测的
+        `AtomicPlace` / `CommitBackup` / `RestoreOverwriteBackup` / `RollbackDir` /
+        `IsOverwriteInstall`。
+      - **单测**（`tests\UnitTests.cs`，新增 5 用例 / 21 断言，含内存 `FakeFileOps`）：
+        `AtomicPlace_MoveFails_OldExeKept`（模拟落盘 Move 失败 → 旧 exe 仍在、内容为旧值、
+        `.old` 无残留）、`AtomicPlace_Success_KeepsBackupUntilCommit`、`Rollback_Overwrite
+        KeepsExistingInstall`（模拟覆盖安装中途失败 → 目录未被删、旧 exe 从备份还原；另覆盖
+        「尚无备份」的子场景）、`Rollback_FreshInstallDeletesDir`、`IsOverwriteInstall`。
+        `build\unit.bat` **45 用例 / 126 断言全绿，退出码 0**（AW-5 为 40/105）。
+      - **撤掉修复确认变红（定点破坏，两轮）**：
+        ① (a)：把 `AtomicPlace` 失败分支里的 `fs.MoveFile(oldPath, exePath)` 删掉（复现
+        「落盘失败不还原」），`grep`/`sed` 确认工作树那处已无还原调用后重跑 →
+        **`AtomicPlace_MoveFails_OldExeKept` 2 个断言变红、退出码 1**；还原后重跑全绿。
+        ② (b)：把 `RollbackDir` 的 `if (wasOverwrite)` 改成 `if (wasOverwrite && false)`
+        （复现「无条件删目录」），`grep` 确认改动存在后重跑 →
+        **`Rollback_OverwriteKeepsExistingInstall` 4 个断言变红、退出码 1**；还原后
+        `grep` 确认 `break-check` 计数为 0、重跑 **126/126 全绿**（先确认回退生效再取信）。
+      - **红线**：本项只跑 `unit.bat`（它已编译全部产品源码，等于全项目编译检查），
+        **未跑 E2E、未触碰 `HKCU\Environment`**（无 `%TEMP%` 残留）；未引入任何第三方依赖；
+        源码保持 C# 5（interface + 纯函数/`out`，无新语法）；显式 `ls` 确认 `src\BuildInfo.cs`
+        仍在（858 字节，未被 stub 污染）。README:71「原子落盘」与 77「自动回滚」的表述
+        现在名副其实，无需改文档。**无卡点**。
 
 - [ ] **AW-7 清理死代码与冗余判定（打磨）**
       四处（`src\MainForm.cs:43` 的 `_logPath` 只在 511 行赋值、全文件从未读取；
