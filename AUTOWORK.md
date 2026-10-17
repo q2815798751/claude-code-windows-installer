@@ -188,7 +188,7 @@
       - **文档**：`README.md:82`、`docs\PLAN.md:120` 宣称的「用新 PATH 实际启动 `claude --version`」
         现在**名副其实**，无需改文档。
 
-- [ ] **AW-16 修 `unit.bat` 的 BuildInfo stub 路径 bug（AW-0 复查实测，中等）**
+- [x] **AW-16 修 `unit.bat` 的 BuildInfo stub 路径 bug（AW-0 复查实测，中等）**
       > 编号后补，但**优先级高于 AW-2**——它挡着「在干净克隆里验证」这条所有人都会走的路。
 
       AW-0 的对抗性复查**实测**出一个真 bug：`build\unit.bat` 第 49-66 行的
@@ -222,6 +222,34 @@
          依赖 `BuildInfo.ReleaseVersion != "0.0.0"`，而干净克隆里 `unit.bat` 生成的 stub
          恰好是 `0.0.0` → 该断言假红。这与本项的 stub 路径 bug **同源**，
          修 stub 时一并把这条测试改成不依赖具体版本值。
+      **结果（2026-10-17）**：完成（commit 7abf9ad）。
+      - **修法**（`build\unit.bat`）：`if not exist` 块内所有 `%BI%` 改为 `!BI!`
+        （`setlocal EnableDelayedExpansion` 已开），并加注释说明为何必须延迟展开。
+      - **干净克隆复现 + 验证**（本项的关键，`git clone` 到 `%TEMP%` 下的临时目录）：
+        修复前 clone 里跑 `build\unit.bat` → stub 被写进 `src\BuildInfo.cs`（553 字节）、
+        编译报 `error CS2001 ... build\work\BuildInfo.stub.cs`、**退出码 1**（bug 复现）；
+        修复后（从 commit 7abf9ad 重新 clone）→ **退出码 0、32 用例 / 83 断言全绿、
+        `src\BuildInfo.cs` 未生成**（stub 正确落在 `build\work\BuildInfo.stub.cs`）、
+        `git status` 干净。
+        ⚠️ 注意：`src\BuildInfo.cs` 在 `.gitignore` 里，**光看 `git status` 干净不足以
+        证明没被污染**——必须显式 `ls src\BuildInfo.cs` 确认文件不存在。
+      - **判别性用例移植**（`tests\UnitTests.cs`，新增 `Test_RunViaPath_ResolvesThroughPath`，
+        1 用例 / 3 断言）：临时目录里放假 `claude.cmd`（只以 `.cmd` 形式存在，只能经 PATH
+        + PATHEXT 解析到），分别用「PATH 含该目录」和「PATH 不含该目录」调**生产代码**
+        `InstallerCore.RunViaPath`，断言前者退出码 0 且输出含假命令标记、后者非 0。
+        中性工作目录（不含 `claude.cmd`），排除「当前目录命中」的干扰。
+      - **测试有效性（撤掉修复验证变红）**：把 `RunViaPath` 里传给 `RunCapture` 的
+        `pathOverride` 临时改成 `null`（即不再按注入的 PATH 解析），`git diff` 确认改动
+        **确实存在**后重跑 → **2 个断言变红、退出码 1**（新用例）；还原后 `git diff`
+        该行为空、重跑 **83/83 全绿**（先确认回退生效再取信）。
+      - **假红修复**：`Test_VerifyLaunchViaPath_ReportsFailure` 里第二个 runner 的
+        输出从 `"0.0.0-not-the-expected-version"` 改成 `"unexpected-output-not-a-version"`
+        （不含任何版本号），使其不再依赖 `BuildInfo.ReleaseVersion` 的具体值；
+        干净克隆（stub 版本 = `0.0.0`）下该用例已绿。
+      - **用例数**：`build\unit.bat` **32 用例 / 83 断言全绿，退出码 0**（AW-2 为 31/80）。
+      - **文档**：`README.md` 的「测试」节删掉已被 AW-1 修掉的不实描述
+        （「卸载路径当前会无条件删除用户级环境变量」），改为如实描述「会写入用户级
+        环境变量，护栏仍值得保留；无条件删除问题已在 AW-1 修复」。
 
 - [ ] **AW-17 修 E2E 护栏把明文凭据留在 `%TEMP%`（AW-0 复查实测，安全）**
       > 编号后补，优先级高于 AW-2（涉及真实凭据；用户已于 2026-10-17 拍板处理方式）。
