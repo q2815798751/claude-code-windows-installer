@@ -698,6 +698,51 @@ namespace ClaudeCodeSetup
                   "unknown arch still warns and assumes x64");
         }
 
+        // ---- AW-7: Preflight.OsVerdict (OS build boundary behaviour) ----
+        //
+        // CheckOs() reads the registry, so its verdict logic was extracted into the
+        // pure helper Preflight.OsVerdict(build, name) (same approach as AW-3/AW-4).
+        // AW-7 flagged the `if (build < 10240)` branch as redundant with the following
+        // `if (build < 17763)`; inspection shows it is NOT fully redundant: the two
+        // carry DIFFERENT user-facing advice, so deleting it would change what a
+        // pre-Windows-10 user sees. These tests pin the boundary behaviour AND that
+        // distinction, so a future "cleanup" that unifies them goes red.
+        private static void Test_OsVerdict_Boundaries()
+        {
+            CheckItem at10240 = Preflight.OsVerdict(10240, "Windows 10 Pro");
+            Check(at10240.State == CheckState.Fail,
+                  "build 10240 (Win10 RTM, below 1809) is rejected");
+            Check(at10240.Detail.IndexOf("10240", StringComparison.Ordinal) >= 0,
+                  "the rejection detail carries the build number");
+
+            CheckItem at17762 = Preflight.OsVerdict(17762, "Windows 10 Pro");
+            Check(at17762.State == CheckState.Fail,
+                  "build 17762 (one below 1809) is rejected");
+
+            CheckItem at17763 = Preflight.OsVerdict(17763, "Windows 10 Pro");
+            Check(at17763.State == CheckState.Pass,
+                  "build 17763 (Win10 1809) passes");
+            Check(at17763.Detail.IndexOf("17763", StringComparison.Ordinal) >= 0,
+                  "the pass detail carries the build number");
+        }
+
+        private static void Test_OsVerdict_PreWindows10Advice()
+        {
+            // The two advice strings differ: the pre-Windows-10 one ("Claude Code
+            // needs Windows 10 1809 ...") contains the ASCII marker "Claude Code",
+            // while the generic "version too old" one (build 10240..17762) does not.
+            // Asserting on the ASCII marker keeps this file ASCII-only (see header).
+            CheckItem pre = Preflight.OsVerdict(9600, "Windows 8.1"); // build < 10240
+            Check(pre.State == CheckState.Fail,
+                  "pre-Windows-10 (build 9600) is rejected");
+            Check(pre.Advice.IndexOf("Claude Code", StringComparison.Ordinal) >= 0,
+                  "pre-Windows-10 advice keeps its own wording (mentions Claude Code)");
+
+            CheckItem old10 = Preflight.OsVerdict(10240, "Windows 10 Pro"); // >= 10240
+            Check(old10.Advice.IndexOf("Claude Code", StringComparison.Ordinal) < 0,
+                  "old Windows 10 (build >= 10240) uses the different too-old wording");
+        }
+
         // ---- AW-5: Program.ParseUninstallArgs / UnknownArgs ----------------
         //
         // build\test.bat:68 passed --keep-config, but Program.cs only knew
@@ -958,6 +1003,9 @@ namespace ClaudeCodeSetup
             Run("CheckExisting_AdviceSaysPrepend", Test_CheckExisting_AdviceSaysPrepend);
 
             Run("ArchVerdict_X86Rejected", Test_ArchVerdict_X86Rejected);
+
+            Run("OsVerdict_Boundaries", Test_OsVerdict_Boundaries);
+            Run("OsVerdict_PreWindows10Advice", Test_OsVerdict_PreWindows10Advice);
 
             Run("ParseUninstallArgs_KeepConfig", Test_ParseUninstallArgs_KeepConfig);
             Run("ParseUninstallArgs_DeleteConfig", Test_ParseUninstallArgs_DeleteConfig);

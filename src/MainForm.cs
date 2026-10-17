@@ -40,7 +40,6 @@ namespace ClaudeCodeSetup
         private volatile bool   _busy;
         private bool            _installDone;
         private int             _checkIndex;
-        private string          _logPath;
 
         private static readonly Color C_Pass   = Color.FromArgb(16, 124, 16);
         private static readonly Color C_Warn   = Color.FromArgb(186, 108, 0);
@@ -504,22 +503,13 @@ namespace ClaudeCodeSetup
             _btnPrimary.Enabled = true;
             _btnSecondary.Text = ok ? "完  成" : "关  闭";
             _btnSecondary.Enabled = true;
-
-            try
-            {
-                string logPath = Path.Combine(Util.InstallDir(), "install.log");
-                if (File.Exists(logPath)) _logPath = logPath;
-            }
-            catch { }
         }
 
         private void OnSecondary(object sender, EventArgs e)
         {
-            if (_installDone && _btnSecondary.Text.StartsWith("完", StringComparison.Ordinal))
-            {
-                Close();
-                return;
-            }
+            // 副按钮（安装完成时文案为「完成」，否则为「关闭」）的行为始终是关闭窗口。
+            // 原来这里有个 `if (_installDone && 文案以「完」开头)` 的分支，但它与紧随其后的
+            // Close() 完全相同，是冗余判定，已删除。
             Close();
         }
 

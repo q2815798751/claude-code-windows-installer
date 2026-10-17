@@ -169,7 +169,6 @@ namespace ClaudeCodeSetup
         // ── 2. 操作系统 ──────────────────────────────────────────
         private static CheckItem CheckOs()
         {
-            CheckItem c = new CheckItem("os", "操作系统");
             int build = 0;
             string name = "";
             try
@@ -195,18 +194,30 @@ namespace ClaudeCodeSetup
                 name = "Windows (build " + build + ")";
             }
 
-            if (build < 10240)
-            {
-                c.State = CheckState.Fail;
-                c.Detail = name + " (build " + build + ")";
-                c.Advice = "Claude Code 需要 Windows 10 1809 (build 17763) 或更高版本。";
-                return c;
-            }
+            return OsVerdict(build, name);
+        }
+
+        // OS 版本判定（纯函数，输入是 build 号与系统名）：
+        // CheckOs 要读注册表，单测里无法确定性地驱动到每个分支，故把判定逻辑抽出来
+        // 直接断言（与 AW-3 的 ExistingAdvice、AW-4 的 ArchVerdict 同理）。
+        //
+        // ⚠️ build < 10240（Windows 10 之前，如 Win7/8/8.1）与 10240..17762
+        // （Windows 10 但版本过旧）是**刻意区分**的两档，Advice 文案不同：
+        // 前者是「Claude Code 需要 Windows 10 1809…」，后者是「版本过旧，需要…」。
+        // 所以原 `if (build < 10240)` 并非「被下一条完全覆盖」的可删冗余分支——
+        // 删掉会改变 build < 10240 时用户看到的提示文案，故保留（见 AW-7）。
+        internal static CheckItem OsVerdict(int build, string name)
+        {
+            CheckItem c = new CheckItem("os", "操作系统");
+
             if (build < 17763)
             {
                 c.State = CheckState.Fail;
                 c.Detail = name + " (build " + build + ")";
-                c.Advice = "版本过旧，需要 Windows 10 1809 (build 17763) 或更高版本。";
+                if (build < 10240)
+                    c.Advice = "Claude Code 需要 Windows 10 1809 (build 17763) 或更高版本。";
+                else
+                    c.Advice = "版本过旧，需要 Windows 10 1809 (build 17763) 或更高版本。";
                 return c;
             }
 
