@@ -135,6 +135,67 @@ namespace ClaudeCodeSetup
             public void DeleteDir(string path) { Dirs.Remove(path); }
         }
 
+        // ---- AW-11: IFileOps whose delete/move operations can be made to throw ----
+        //
+        // The AW-11 fix makes the main-chain catches LOG instead of swallowing.
+        // To drive those failure paths deterministically we need a filesystem that
+        // can be told to fail a chosen DeleteFile / DeleteDir / MoveFile.
+        private sealed class ThrowingFileOps : IFileOps
+        {
+            internal readonly Dictionary<string, string> Files =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            internal readonly Dictionary<string, bool> Dirs =
+                new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            internal string FailDeleteFile;   // DeleteFile throws when path matches
+            internal string FailDeleteDir;    // DeleteDir throws when path matches
+            internal readonly List<string> FailMoveSrcs = new List<string>(); // MoveFile throws for these srcs
+
+            public bool FileExists(string path) { return Files.ContainsKey(path); }
+            public bool DirExists(string path) { return Dirs.ContainsKey(path); }
+
+            public void MoveFile(string src, string dst)
+            {
+                for (int i = 0; i < FailMoveSrcs.Count; i++)
+                    if (string.Equals(src, FailMoveSrcs[i], StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("simulated move failure: " + src);
+                if (!Files.ContainsKey(src))
+                    throw new FileNotFoundException("no such file: " + src);
+                Files[dst] = Files[src];
+                Files.Remove(src);
+            }
+
+            public void DeleteFile(string path)
+            {
+                if (FailDeleteFile != null &&
+                    string.Equals(path, FailDeleteFile, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("simulated delete failure: " + path);
+                Files.Remove(path);
+            }
+
+            public void DeleteDir(string path)
+            {
+                if (FailDeleteDir != null &&
+                    string.Equals(path, FailDeleteDir, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("simulated rmdir failure: " + path);
+                Dirs.Remove(path);
+            }
+        }
+
+        // ---- AW-11: helpers to assert that a failure was LOGGED ----
+        //
+        // Log keeps every line in a static list (no file is written during unit
+        // tests because Log.Init is never called here), so a test can snapshot the
+        // line count, exercise the production code, then check whether a new line
+        // carrying an ASCII marker appeared. ASCII markers keep this file
+        // ASCII-only (see header).
+        private static bool LoggedSince(int before, string needle)
+        {
+            List<string> all = Log.Lines();
+            for (int i = before; i < all.Count; i++)
+                if (all[i].IndexOf(needle, StringComparison.Ordinal) >= 0) return true;
+            return false;
+        }
+
         // ---------------------------------------------------------------- tests
 
         // ---- Util.NormalizeDir --------------------------------------------
@@ -1001,6 +1062,203 @@ namespace ClaudeCodeSetup
                   "the download step is reached with the previous run's leftover already removed");
         }
 
+        // ---- AW-11: main-chain catches must LOG, not silently swallow ----
+        //
+        // The repo had many empty catches. Most are deliberate defensive code, but
+        // the ones on the install/uninstall main chain hide REAL failures - above
+        // all on the uninstall path, where a silently-swallowed delete leaves the
+        // user believing everything was removed when it was not. AW-11 only touches
+        // the Installer.cs catches around deleting files / deleting the user env
+        // var / the manifest; the rest are left alone (see AUTOWORK "to confirm").
+        // These tests drive the failure paths with an injected ThrowingFileOps or
+        // an injected EnvVarRemover and assert the failure is recorded/returned.
+
+        private static void Test_TryDeleteFile_LogsOnFailure()
+        {
+            // Success: the file is removed and NO failure log is written.
+            ThrowingFileOps ok = new ThrowingFileOps();
+            ok.Files["C:\\CC\\shortcut.lnk"] = "x";
+            int b0 = Log.Lines().Count;
+            Check(InstallerCore.TryDeleteFile("C:\\CC\\shortcut.lnk", ok, "shortcut"),
+                  "TryDeleteFile reports success when the file is removed");
+            Check(!ok.FileExists("C:\\CC\\shortcut.lnk"), "the file is actually gone");
+            Check(Log.Lines().Count == b0, "a successful delete writes no failure log");
+
+            // Absent file: success, no log (nothing to delete).
+            ThrowingFileOps absent = new ThrowingFileOps();
+            int b1 = Log.Lines().Count;
+            Check(InstallerCore.TryDeleteFile("C:\\CC\\none.lnk", absent, "shortcut"),
+                  "TryDeleteFile is a no-op success when the file does not exist");
+            Check(Log.Lines().Count == b1, "an absent file writes no failure log");
+
+            // Failure: reports false AND logs (the AW-11 point - no silent swallow).
+            ThrowingFileOps bad = new ThrowingFileOps();
+            bad.Files["C:\\CC\\locked.lnk"] = "x";
+            bad.FailDeleteFile = "C:\\CC\\locked.lnk";
+            int b2 = Log.Lines().Count;
+            Check(!InstallerCore.TryDeleteFile("C:\\CC\\locked.lnk", bad, "shortcut"),
+                  "TryDeleteFile reports failure when the delete throws");
+            Check(LoggedSince(b2, "locked.lnk"),
+                  "the failed delete is logged with the path (not silently swallowed)");
+        }
+
+        private static void Test_TryDeleteDir_LogsOnFailure()
+        {
+            ThrowingFileOps ok = new ThrowingFileOps();
+            ok.Dirs["C:\\CC\\sub"] = true;
+            Check(InstallerCore.TryDeleteDir("C:\\CC\\sub", ok, "dir"), "TryDeleteDir reports success");
+            Check(!ok.DirExists("C:\\CC\\sub"), "the directory is actually gone");
+
+            ThrowingFileOps absent = new ThrowingFileOps();
+            int b1 = Log.Lines().Count;
+            Check(InstallerCore.TryDeleteDir("C:\\CC\\none", absent, "dir"),
+                  "TryDeleteDir is a no-op success when the dir is absent");
+            Check(Log.Lines().Count == b1, "an absent dir writes no failure log");
+
+            ThrowingFileOps bad = new ThrowingFileOps();
+            bad.Dirs["C:\\CC\\locked"] = true;
+            bad.FailDeleteDir = "C:\\CC\\locked";
+            int b2 = Log.Lines().Count;
+            Check(!InstallerCore.TryDeleteDir("C:\\CC\\locked", bad, "dir"),
+                  "TryDeleteDir reports failure when rmdir throws");
+            Check(LoggedSince(b2, "locked"), "the failed rmdir is logged (not silently swallowed)");
+        }
+
+        private static void Test_RemoveGitBashEnvIfOwned_RemovesOwnedValue()
+        {
+            string called = null;
+            EnvVarRemover remover = delegate(string name) { called = name; };
+            int b = Log.Lines().Count;
+            bool ok = InstallerCore.RemoveGitBashEnvIfOwned(
+                "C:\\Git\\bin\\bash.exe", true, "C:\\Git\\bin\\bash.exe", "C:\\CC", remover);
+            Check(ok, "removing an installer-owned value reports success");
+            Eq("CLAUDE_CODE_GIT_BASH_PATH", called,
+               "the injected remover is invoked with the variable name");
+            Check(Log.Lines().Count > b, "the removal is logged");
+        }
+
+        private static void Test_RemoveGitBashEnvIfOwned_LogsRemovalFailure()
+        {
+            // The headline AW-11 fix: the uninstall path used to swallow this with an
+            // empty catch, so a failed env-var delete looked like a clean uninstall.
+            EnvVarRemover boom = delegate(string name) { throw new IOException("boom-removal"); };
+            int b = Log.Lines().Count;
+            bool ok = InstallerCore.RemoveGitBashEnvIfOwned(
+                "C:\\Git\\bin\\bash.exe", true, "C:\\Git\\bin\\bash.exe", "C:\\CC", boom);
+            Check(!ok, "a failed removal reports failure (instead of the old silent catch)");
+            Check(LoggedSince(b, "boom-removal"), "the removal failure is logged with its cause");
+        }
+
+        private static void Test_RemoveGitBashEnvIfOwned_KeepsUserValue()
+        {
+            bool called = false;
+            EnvVarRemover remover = delegate(string name) { called = true; };
+            int b = Log.Lines().Count;
+            bool ok = InstallerCore.RemoveGitBashEnvIfOwned(
+                "E:\\Git\\bin\\bash.exe", false, "", "C:\\CC", remover);
+            Check(ok, "a user-owned value is kept (reported as handled, not a failure)");
+            Check(!called, "the remover is NOT invoked for a user-owned value");
+            Check(Log.Lines().Count > b, "keeping the user value is logged");
+        }
+
+        private static void Test_RemoveGitBashEnvIfOwned_Absent()
+        {
+            bool called = false;
+            EnvVarRemover remover = delegate(string name) { called = true; };
+            int b = Log.Lines().Count;
+            Check(InstallerCore.RemoveGitBashEnvIfOwned(null, true, "x", "C:\\CC", remover),
+                  "an absent variable is a no-op success");
+            Check(!called, "the remover is NOT invoked when the variable is absent");
+            Check(Log.Lines().Count == b, "an absent variable writes no log");
+        }
+
+        private static void Test_CommitBackup_LogsOnFailure()
+        {
+            ThrowingFileOps fs = new ThrowingFileOps();
+            fs.Files["C:\\CC\\claude.exe.old"] = "OLD";
+            fs.FailDeleteFile = "C:\\CC\\claude.exe.old";
+            int b = Log.Lines().Count;
+            InstallerCore.CommitBackup("C:\\CC\\claude.exe", fs);   // must not throw
+            Check(fs.FileExists("C:\\CC\\claude.exe.old"),
+                  "the backup survives when its deletion fails (best-effort)");
+            Check(LoggedSince(b, "claude.exe.old"), "the failed backup cleanup is logged");
+        }
+
+        private static void Test_RestoreOverwriteBackup_LogsOnFailure()
+        {
+            ThrowingFileOps fs = new ThrowingFileOps();
+            fs.Files["C:\\CC\\claude.exe"] = "NEW";
+            fs.Files["C:\\CC\\claude.exe.old"] = "OLD";
+            fs.FailMoveSrcs.Add("C:\\CC\\claude.exe.old"); // the restore Move fails
+            int b = Log.Lines().Count;
+            InstallerCore.RestoreOverwriteBackup("C:\\CC\\claude.exe", fs);   // must not throw
+            Check(LoggedSince(b, "claude.exe.old"),
+                  "a failed backup restore is logged (otherwise the user's exe vanishes silently)");
+        }
+
+        private static void Test_RollbackDir_FreshInstallDeleteFails_ReportsNotDeleted()
+        {
+            ThrowingFileOps fs = new ThrowingFileOps();
+            fs.Dirs["C:\\CC"] = true;
+            fs.FailDeleteDir = "C:\\CC";
+            int b = Log.Lines().Count;
+            bool deleted = InstallerCore.RollbackDir("C:\\CC", "C:\\CC\\claude.exe", false, fs);
+            Check(!deleted,
+                  "a failed dir delete must NOT be reported as 'deleted' (the old code lied)");
+            Check(LoggedSince(b, "C:\\CC"), "the failed rollback delete is logged");
+        }
+
+        private static void Test_AtomicPlace_RestoreFails_LogsBoth()
+        {
+            ThrowingFileOps fs = new ThrowingFileOps();
+            fs.Files["C:\\CC\\claude.exe"] = "OLD";
+            fs.Files["C:\\CC\\claude.exe.tmp"] = "NEW";
+            fs.FailMoveSrcs.Add("C:\\CC\\claude.exe.tmp"); // placement fails
+            fs.FailMoveSrcs.Add("C:\\CC\\claude.exe.old"); // and the restore also fails
+            int b = Log.Lines().Count;
+            bool threw = false;
+            try { InstallerCore.AtomicPlace("C:\\CC\\claude.exe", "C:\\CC\\claude.exe.tmp", fs); }
+            catch { threw = true; }
+            Check(threw, "AtomicPlace still propagates the placement failure");
+            Check(LoggedSince(b, "claude.exe.old"),
+                  "a failed restore of the user's exe is logged (otherwise it disappears silently)");
+        }
+
+        private static void Test_ReadGitBashManifest_LogsOnReadFailure()
+        {
+            string d = TempDir();
+            try
+            {
+                string path = Path.Combine(d, "manifest.json");
+                // Hold the manifest open with FileShare.None so File.ReadAllText throws
+                // an IOException deterministically (File.Exists still returns true).
+                using (FileStream lockFs = new FileStream(path, FileMode.Create,
+                                                          FileAccess.Write, FileShare.None))
+                {
+                    int b = Log.Lines().Count;
+                    string rec;
+                    bool wrote = InstallerCore.ReadGitBashManifest(d, out rec);
+                    Check(!wrote, "an unreadable manifest is treated as not-ours (safe default)");
+                    Check(LoggedSince(b, "manifest.json"),
+                          "the manifest read failure is logged (not silently swallowed)");
+                }
+            }
+            finally { RmTree(d); }
+        }
+
+        private static void Test_CleanStaleTempZip_LogsOnFailure()
+        {
+            string path = InstallerCore.Arm64TempZipPath("C:\\Temp");
+            ThrowingFileOps fs = new ThrowingFileOps();
+            fs.Files[path] = "STALE-96MB-PAYLOAD";
+            fs.FailDeleteFile = path;
+            int b = Log.Lines().Count;
+            Check(!InstallerCore.CleanStaleTempZip(path, fs),
+                  "CleanStaleTempZip still reports false when the delete fails");
+            Check(LoggedSince(b, "claude-arm64-payload.zip"),
+                  "the failed temp-zip cleanup is logged (not silently swallowed)");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -1074,6 +1332,19 @@ namespace ClaudeCodeSetup
             Run("Arm64TempZipPath_Predictable", Test_Arm64TempZipPath_Predictable);
             Run("CleanStaleTempZip", Test_CleanStaleTempZip);
             Run("PrepareArm64TempZip_CleansLeftover", Test_PrepareArm64TempZip_CleansLeftover);
+
+            Run("TryDeleteFile_LogsOnFailure", Test_TryDeleteFile_LogsOnFailure);
+            Run("TryDeleteDir_LogsOnFailure", Test_TryDeleteDir_LogsOnFailure);
+            Run("RemoveGitBashEnvIfOwned_RemovesOwnedValue", Test_RemoveGitBashEnvIfOwned_RemovesOwnedValue);
+            Run("RemoveGitBashEnvIfOwned_LogsRemovalFailure", Test_RemoveGitBashEnvIfOwned_LogsRemovalFailure);
+            Run("RemoveGitBashEnvIfOwned_KeepsUserValue", Test_RemoveGitBashEnvIfOwned_KeepsUserValue);
+            Run("RemoveGitBashEnvIfOwned_Absent", Test_RemoveGitBashEnvIfOwned_Absent);
+            Run("CommitBackup_LogsOnFailure", Test_CommitBackup_LogsOnFailure);
+            Run("RestoreOverwriteBackup_LogsOnFailure", Test_RestoreOverwriteBackup_LogsOnFailure);
+            Run("RollbackDir_FreshInstallDeleteFails_ReportsNotDeleted", Test_RollbackDir_FreshInstallDeleteFails_ReportsNotDeleted);
+            Run("AtomicPlace_RestoreFails_LogsBoth", Test_AtomicPlace_RestoreFails_LogsBoth);
+            Run("ReadGitBashManifest_LogsOnReadFailure", Test_ReadGitBashManifest_LogsOnReadFailure);
+            Run("CleanStaleTempZip_LogsOnFailure", Test_CleanStaleTempZip_LogsOnFailure);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);

@@ -69,6 +69,13 @@ namespace ClaudeCodeSetup
         public void DeleteDir(string path) { Directory.Delete(path, true); }
     }
 
+    /// <summary>
+    /// AW-11：「移除一个用户级环境变量」的可注入动作。抽出来是为了让单测能确定性地
+    /// 驱动「删除环境变量失败」这条路径——直接调 Environment.SetEnvironmentVariable
+    /// 在单测里造不出失败，注入一个会抛异常的假实现即可。
+    /// </summary>
+    internal delegate void EnvVarRemover(string name);
+
     internal static class InstallerCore
     {
         internal const string PayloadEntry = "claude.exe";
@@ -108,11 +115,15 @@ namespace ClaudeCodeSetup
         /// </summary>
         internal static bool CleanStaleTempZip(string path, IFileOps fs)
         {
+            // AW-11：删除失败记一条日志，不再静默吞掉（best-effort 语义不变：仍返回 false、绝不抛出）。
             try
             {
                 if (fs.FileExists(path)) { fs.DeleteFile(path); return true; }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Write("清理上一轮 ARM64 临时载荷失败 " + path + ": " + Net.Root(ex));
+            }
             return false;
         }
 
@@ -338,7 +349,8 @@ namespace ClaudeCodeSetup
             }
             finally
             {
-                if (tmpZip != null) { try { File.Delete(tmpZip); } catch { } }
+                // AW-11：删除失败记日志（best-effort，不抛出）。
+                if (tmpZip != null) TryDeleteFile(tmpZip, new RealFileOps(), "ARM64 临时载荷");
             }
             return r;
         }
@@ -528,22 +540,15 @@ namespace ClaudeCodeSetup
                                                                     EnvironmentVariableTarget.User);
                     string recorded;
                     bool wrote = ReadGitBashManifest(dir, out recorded);
-                    if (string.IsNullOrEmpty(cur))
-                    {
-                        // 变量不存在：无操作，不报错
-                    }
-                    else if (ShouldRemoveGitBashEnv(cur, wrote, recorded, dir))
-                    {
-                        Environment.SetEnvironmentVariable("CLAUDE_CODE_GIT_BASH_PATH", null,
-                                                           EnvironmentVariableTarget.User);
-                        Log.Write("已移除本安装器写入的 CLAUDE_CODE_GIT_BASH_PATH");
-                    }
-                    else
-                    {
-                        Log.Write("保留用户自有的 CLAUDE_CODE_GIT_BASH_PATH: " + cur);
-                    }
+                    // AW-11：移除失败会记日志并返回 false，不再被空 catch 静默吞掉
+                    // （旧的空 catch 会让用户以为卸载把环境变量也删干净了，其实没有）。
+                    RemoveGitBashEnvIfOwned(cur, wrote, recorded, dir, DefaultEnvRemover);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // AW-11：旧实现是空 catch——处理该变量时任何异常都被吞掉。
+                    Log.Write("处理 CLAUDE_CODE_GIT_BASH_PATH 失败: " + Net.Root(ex));
+                }
 
                 // 快捷方式
                 DeleteIfExists(Path.Combine(Util.DesktopDir(), Const.ProductName + ".lnk"));
@@ -554,7 +559,11 @@ namespace ClaudeCodeSetup
                     if (Directory.Exists(sm) && Directory.GetFileSystemEntries(sm).Length == 0)
                         Directory.Delete(sm, false);
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    // AW-11：删除空的开始菜单目录失败会留下残留目录，记日志而不是静默吞掉。
+                    Log.Write("删除空的开始菜单目录失败: " + Net.Root(ex));
+                }
                 Log.Write("已移除快捷方式");
 
                 // 注册表
@@ -681,7 +690,8 @@ namespace ClaudeCodeSetup
             if (hadOld)
             {
                 // 清掉上一轮可能残留的备份，避免 Move 因目标已存在而失败。
-                try { if (fs.FileExists(oldPath)) fs.DeleteFile(oldPath); } catch { }
+                try { if (fs.FileExists(oldPath)) fs.DeleteFile(oldPath); }
+                catch (Exception ex) { Log.Write("清理上一轮 claude.exe.old 备份失败 " + oldPath + ": " + Net.Root(ex)); }
                 fs.MoveFile(exePath, oldPath);
             }
             try
@@ -693,7 +703,12 @@ namespace ClaudeCodeSetup
                 // 落盘失败：把备份改回原名，恢复用户原有的 claude.exe，再向上抛。
                 if (hadOld)
                 {
-                    try { fs.MoveFile(oldPath, exePath); } catch { }
+                    try { fs.MoveFile(oldPath, exePath); }
+                    catch (Exception rex)
+                    {
+                        // AW-11：还原失败意味着用户的 claude.exe 没了（只剩 .old），绝不能静默。
+                        Log.Write("还原 claude.exe 备份失败 " + oldPath + " -> " + exePath + ": " + Net.Root(rex));
+                    }
                 }
                 throw;
             }
@@ -711,7 +726,11 @@ namespace ClaudeCodeSetup
                 string oldPath = exePath + ".old";
                 if (fs.FileExists(oldPath)) fs.DeleteFile(oldPath);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // AW-11：删除失败只会留下多余的 .old（不影响 claude.exe），但记日志便于排查。
+                Log.Write("删除 claude.exe.old 备份失败: " + Net.Root(ex));
+            }
         }
 
         /// <summary>
@@ -722,8 +741,10 @@ namespace ClaudeCodeSetup
         {
             string oldPath = exePath + ".old";
             if (!fs.FileExists(oldPath)) return;
-            try { if (fs.FileExists(exePath)) fs.DeleteFile(exePath); } catch { }
-            try { fs.MoveFile(oldPath, exePath); } catch { }
+            try { if (fs.FileExists(exePath)) fs.DeleteFile(exePath); }
+            catch (Exception ex) { Log.Write("还原备份前删除当前 claude.exe 失败 " + exePath + ": " + Net.Root(ex)); }
+            try { fs.MoveFile(oldPath, exePath); }
+            catch (Exception ex) { Log.Write("还原 claude.exe 备份失败 " + oldPath + " -> " + exePath + ": " + Net.Root(ex)); }
         }
 
         /// <summary>
@@ -742,23 +763,28 @@ namespace ClaudeCodeSetup
                 RestoreOverwriteBackup(exePath, fs);
                 return false;
             }
-            try { if (fs.DirExists(dir)) fs.DeleteDir(dir); } catch { }
-            return true;
+            // AW-11：删除失败时返回 false（旧实现无条件返回 true，会让调用方谎报「已删除目录」）；
+            // TryDeleteDir 同时会记一条日志，不再静默吞掉失败。
+            return TryDeleteDir(dir, fs, "回滚安装目录");
         }
 
         private static void Rollback(InstallOptions opt, bool wasOverwrite)
         {
             string dir = opt.InstallDir;
             string exePath = Path.Combine(dir, "claude.exe");
-            try { RemoveFromUserPath(dir); } catch { }
-            try { DeleteIfExists(Path.Combine(Util.DesktopDir(), Const.ProductName + ".lnk")); } catch { }
-            try { DeleteIfExists(Path.Combine(Util.StartMenuDir(), Const.ProductName + ".lnk")); } catch { }
-            try { Registry.CurrentUser.DeleteSubKeyTree(Const.RegUninstall, false); } catch { }
-            bool dirDeleted = false;
-            try { dirDeleted = RollbackDir(dir, exePath, wasOverwrite, new RealFileOps()); } catch { }
+            try { RemoveFromUserPath(dir); }
+            catch (Exception ex) { Log.Write("回滚移除用户 PATH 失败: " + Net.Root(ex)); }
+            // AW-11：DeleteIfExists / RollbackDir 现在自身会记日志、绝不抛出，无需外层空 catch。
+            DeleteIfExists(Path.Combine(Util.DesktopDir(), Const.ProductName + ".lnk"));
+            DeleteIfExists(Path.Combine(Util.StartMenuDir(), Const.ProductName + ".lnk"));
+            try { Registry.CurrentUser.DeleteSubKeyTree(Const.RegUninstall, false); }
+            catch (Exception ex) { Log.Write("回滚删除卸载注册表项失败: " + Net.Root(ex)); }
+            bool dirDeleted = RollbackDir(dir, exePath, wasOverwrite, new RealFileOps());
             if (dirDeleted) Log.Write("回滚完成：已删除本次创建的安装目录");
-            else Log.Write("回滚完成：保留既有安装（覆盖安装，未删除目录；已还原备份）");
-            try { Util.BroadcastEnvironmentChange(); } catch { }
+            else if (wasOverwrite) Log.Write("回滚完成：保留既有安装（覆盖安装，未删除目录；已还原备份）");
+            else Log.Write("回滚完成：删除本次创建的安装目录失败（见上方日志），目录可能残留");
+            try { Util.BroadcastEnvironmentChange(); }
+            catch (Exception ex) { Log.Write("回滚广播环境变更失败: " + Net.Root(ex)); }
         }
 
         // ─────────────────────────────────────────────────────────
@@ -1114,7 +1140,51 @@ namespace ClaudeCodeSetup
                 recordedValue = JsonString(text, "gitBashPath");
                 return true;
             }
-            catch { return false; }
+            catch (Exception ex)
+            {
+                // AW-11：manifest 读取失败会按「非本安装器写入」处理（保留变量，是安全方向），
+                // 但记一条日志，避免异常被静默吞掉。
+                Log.Write("读取 manifest 失败 " + dir + ": " + Net.Root(ex));
+                return false;
+            }
+        }
+
+        // ── AW-11：卸载时移除 CLAUDE_CODE_GIT_BASH_PATH（可注入 + 失败必记日志）──────
+
+        /// <summary>AW-11：生产用的移除动作——真的删用户级环境变量。</summary>
+        internal static void DefaultEnvRemover(string name)
+        {
+            Environment.SetEnvironmentVariable(name, null, EnvironmentVariableTarget.User);
+        }
+
+        /// <summary>
+        /// AW-11：卸载时按 AW-1 契约处理用户级 CLAUDE_CODE_GIT_BASH_PATH，移除动作可注入。
+        /// 返回 true 表示状态符合预期（变量不存在 / 按契约保留 / 已成功移除）；
+        /// false 表示**尝试移除但失败**——旧实现用空 catch 把这种失败静默吞掉，
+        /// 用户会以为卸载把环境变量也删干净了，其实没有。
+        /// 归属判定复用 ShouldRemoveGitBashEnv（AW-1）。
+        /// </summary>
+        internal static bool RemoveGitBashEnvIfOwned(string currentValue, bool manifestWroteIt,
+                                                     string recordedValue, string installDir,
+                                                     EnvVarRemover remove)
+        {
+            if (string.IsNullOrEmpty(currentValue)) return true;   // 变量不存在：无操作
+            if (!ShouldRemoveGitBashEnv(currentValue, manifestWroteIt, recordedValue, installDir))
+            {
+                Log.Write("保留用户自有的 CLAUDE_CODE_GIT_BASH_PATH: " + currentValue);
+                return true;
+            }
+            try
+            {
+                remove("CLAUDE_CODE_GIT_BASH_PATH");
+                Log.Write("已移除本安装器写入的 CLAUDE_CODE_GIT_BASH_PATH");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("移除 CLAUDE_CODE_GIT_BASH_PATH 失败: " + Net.Root(ex));
+                return false;
+            }
         }
 
         private static string JsonString(string json, string key)
@@ -1253,14 +1323,53 @@ namespace ClaudeCodeSetup
             }
         }
 
+        // ── AW-11：best-effort 删除（失败必留一条日志）─────────────
+
+        /// <summary>
+        /// AW-11：best-effort 删除一个文件，失败时**记一条日志**（而不是像旧的空 catch 那样静默吞掉）。
+        /// 卸载/回滚路径上的静默删除失败会让用户以为已经删干净了，其实没有。
+        /// 返回 true 表示文件已删除或本来就不存在；false 表示尝试删除但失败。
+        /// </summary>
+        internal static bool TryDeleteFile(string path, IFileOps fs, string what)
+        {
+            try
+            {
+                if (fs.FileExists(path)) fs.DeleteFile(path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("删除失败(" + what + ") " + path + ": " + Net.Root(ex));
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// AW-11：best-effort 删除一个目录树，失败时记一条日志并返回 false。
+        /// 返回 true 表示目录已删除或本来就不存在。
+        /// </summary>
+        internal static bool TryDeleteDir(string path, IFileOps fs, string what)
+        {
+            try
+            {
+                if (fs.DirExists(path)) fs.DeleteDir(path);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("删除目录失败(" + what + ") " + path + ": " + Net.Root(ex));
+                return false;
+            }
+        }
+
         private static void SafeDelete(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
+            TryDeleteFile(path, new RealFileOps(), "临时文件");
         }
 
         private static void DeleteIfExists(string path)
         {
-            try { if (File.Exists(path)) File.Delete(path); } catch { }
+            TryDeleteFile(path, new RealFileOps(), "文件");
         }
     }
 }
