@@ -629,6 +629,41 @@ namespace ClaudeCodeSetup
                   "advice mentions the install dir");
         }
 
+        // ---- AW-4: Preflight.ArchVerdict (32-bit Windows must be rejected) ----
+        //
+        // CheckArch() reads Util.NativeArch() from the process environment, so it
+        // cannot be driven deterministically per branch from a unit test. The verdict
+        // logic was therefore extracted into the pure, injectable helper
+        // Preflight.ArchVerdict(arch, out useBundled) (same approach as AW-3's
+        // ExistingAdvice). The bug: "X86" shared the AMD64 branch and returned Pass
+        // with UseBundled=true, so a 32-bit Windows box installed a 64-bit claude.exe
+        // and only failed at the smoke test.
+        private static void Test_ArchVerdict_X86Rejected()
+        {
+            bool ub;
+
+            CheckItem x86 = Preflight.ArchVerdict("X86", out ub);
+            Check(x86.State != CheckState.Pass,
+                  "32-bit Windows (X86) must not pass the arch check");
+            Check(x86.State == CheckState.Fail,
+                  "32-bit Windows (X86) is rejected (default decision)");
+            Check(!string.IsNullOrEmpty(x86.Advice),
+                  "the X86 rejection carries user-facing advice");
+
+            // AMD64 is still supported and keeps using the bundled payload.
+            CheckItem x64 = Preflight.ArchVerdict("AMD64", out ub);
+            Check(x64.State == CheckState.Pass, "AMD64 still passes the arch check");
+            Check(ub, "AMD64 uses the bundled payload");
+
+            // ARM64 and the unknown-arch fallback keep their previous behaviour.
+            CheckItem arm = Preflight.ArchVerdict("ARM64", out ub);
+            Check(arm.State == CheckState.Info && !ub,
+                  "ARM64 still reports Info and downloads (no bundled payload)");
+            CheckItem unk = Preflight.ArchVerdict("", out ub);
+            Check(unk.State == CheckState.Warn && ub,
+                  "unknown arch still warns and assumes x64");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -680,6 +715,8 @@ namespace ClaudeCodeSetup
             Run("RunViaPath_ResolvesThroughPath", Test_RunViaPath_ResolvesThroughPath);
 
             Run("CheckExisting_AdviceSaysPrepend", Test_CheckExisting_AdviceSaysPrepend);
+
+            Run("ArchVerdict_X86Rejected", Test_ArchVerdict_X86Rejected);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);

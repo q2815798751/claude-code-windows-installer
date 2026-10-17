@@ -221,27 +221,53 @@ namespace ClaudeCodeSetup
         // ── 3. CPU 架构 ──────────────────────────────────────────
         private static CheckItem CheckArch(PreflightResult res)
         {
-            CheckItem c = new CheckItem("arch", "CPU 架构");
             string a = Util.NativeArch();
             res.Arch = a;
 
-            if (a == "AMD64" || a == "X86")
+            // 判定逻辑抽成纯函数 ArchVerdict(架构字符串)：CheckArch 依赖
+            // Util.NativeArch()（读进程环境变量），单测里无法确定性地驱动到每个分支，
+            // 故把可注入的纯逻辑单独拿出来直接断言（与 AW-3 的 ExistingAdvice 同理）。
+            bool useBundled;
+            CheckItem c = ArchVerdict(a, out useBundled);
+            res.UseBundled = useBundled;
+            return c;
+        }
+
+        // 架构判定（纯函数，输入是已大写的架构字符串，见 Util.NativeArch）。
+        // ⚠️ 内置载荷是 64 位 claude.exe，32 位 Windows（PROCESSOR_ARCHITECTURE=X86）
+        // 装上后要等到冒烟测试才失败——所以 X86 必须与 AMD64 分开处理，返回 Fail。
+        // useBundled 对 X86 取 true 只是沿用旧值：该状态是阻断性失败，安装不会继续；
+        // 取 false 反而会让网络预检误报「ARM64 需从 GitHub 下载」，故保持 true。
+        internal static CheckItem ArchVerdict(string a, out bool useBundled)
+        {
+            CheckItem c = new CheckItem("arch", "CPU 架构");
+
+            if (a == "AMD64")
             {
-                res.UseBundled = true;
+                useBundled = true;
                 c.State = CheckState.Pass;
                 c.Detail = "x64 — 使用内置载荷，无需联网下载";
                 return c;
             }
+            if (a == "X86")
+            {
+                useBundled = true;
+                c.State = CheckState.Fail;
+                c.Detail = "32 位 Windows (X86) — 不受支持";
+                c.Advice = "Claude Code 只提供 64 位版本，无法在 32 位 Windows 上运行。"
+                         + "请改用 64 位 Windows 后重试。";
+                return c;
+            }
             if (a == "ARM64")
             {
-                res.UseBundled = false;
+                useBundled = false;
                 c.State = CheckState.Info;
                 c.Detail = "ARM64 — 需从 GitHub 下载对应版本 (约 96 MB)";
                 c.Advice = "安装前请确认网络畅通。";
                 return c;
             }
 
-            res.UseBundled = true;
+            useBundled = true;
             c.State = CheckState.Warn;
             c.Detail = "未能识别的架构：" + (a.Length == 0 ? "(未知)" : a) + "，将按 x64 处理";
             return c;
