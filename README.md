@@ -217,6 +217,14 @@ build\e2e-with-backup.bat --keep-backup  :: 跑完保留备份文件（见下面
 > 两份清单也会一起比对；`.reg` 之间仍然做逐字节 `fc /b` 比对，恢复也仍然由 `reg import`
 > 完成——这些安全保证没有改变。
 
+**持续集成（`.github/workflows/ci.yml`）**：每次 push 在 `windows-latest` 上依次跑
+`build\unit.bat`（编译全部产品源码并运行测试）、`build\build.bat`（构建整条流水线）
+和 `dist\ClaudeCodeSetup.exe --selftest`（只读预检）。CI **不**跑
+`build\test.bat` / E2E（会写约 211 MB 并依赖卸载行为），也**不**下载任何真实载荷
+（x64/ARM64 都是大体积网络依赖）；`build\ci-payload.ps1` 生成一个只含 `claude.exe`
+条目的极小合成载荷，让构建流水线与 `--selftest` 无需联网即可真实跑通。
+真实载荷的 SHA256 校验仍由 `build\build.bat` 在本地强制。
+
 > 构建脚本刻意保持纯 ASCII：cmd.exe 会破坏非 ASCII 批处理文件，Windows
 > PowerShell 5.1 也会误解无 BOM 的 UTF-8 脚本。中文只出现在 `.cs` 源文件中，
 > 由 `csc /codepage:65001` 处理。
@@ -241,9 +249,12 @@ build\e2e-with-backup.bat --keep-backup  :: 跑完保留备份文件（见下面
 │   ├── test.bat            端到端测试（会真的安装/卸载）
 │   ├── e2e-with-backup.bat test.bat 的环境护栏包装（备份/比对/恢复 HKCU\Environment）
 │   ├── env-hash.ps1        把 reg 导出转成「值名 + sha256」清单（不含明文）
+│   ├── ci-payload.ps1      CI 用合成载荷（不含真载荷，零网络依赖）
 │   └── unit.bat            零依赖 C# 单元测试（编译并运行 tests\UnitTests.cs）
 ├── tests/
 │   └── UnitTests.cs        自研 assert 式单元测试
+├── .github/workflows/
+│   └── ci.yml              CI：windows-latest 上跑单元测试 + 构建 + --selftest
 └── payload/                官方载荷（不入版本库）
 ```
 

@@ -781,7 +781,7 @@
         未引入任何第三方依赖；源码保持 C# 5（委托 + 纯函数/`out`，无新语法）；
         显式 `ls` 确认 `src\BuildInfo.cs` 仍在（858 字节、mtime 未变，未被 stub 污染）。**无卡点**。
 
-- [ ] **AW-12 加 CI（打磨）**
+- [x] **AW-12 加 CI（打磨）**
       问题：没有 `.github/workflows/`，改动没有任何自动把关。
       修法：加一个 workflow，push 时在 **`windows-latest`** runner 上
       跑 `build\build.bat`（或至少编译 + `build\unit.bat`）与 `--selftest`。
@@ -791,6 +791,47 @@
       验证方式：本地先跑通同样的命令，push 后用 `git credential fill` 取 token
       调 GitHub API 查这次 workflow run 的结果；**查不到就如实说「已推送但未能确认 CI 结果」**，
       不要假装绿了。
+      **结果（2026-10-17）**：完成（commit 13cb8b2）。
+      - **workflow**（`.github/workflows/ci.yml`）：`on: push`（+ `workflow_dispatch`），
+        `runs-on: windows-latest`，四步（均 `shell: cmd`）：
+        ① `build\unit.bat`（编译**全部**产品源码 + 运行测试）；
+        ② `powershell -NoProfile -ExecutionPolicy Bypass -File build\ci-payload.ps1`（合成载荷）；
+        ③ `build\build.bat`（csc 编译 + pack + trailer 校验，6 步全跑）；
+        ④ `dist\ClaudeCodeSetup.exe --selftest --report=build\work\selftest.txt` 后 `type` 该报告
+        （安装器是 winexe，会 `AttachConsole` 到父控制台，**直接管道抓不到 stdout**，
+        故用 `--report=` 落文件再打印，CI 日志可见；非零退出码即判失败）。
+      - **载荷策略（关键决策，写清理由）**：**不下载任何真实载荷**——x64 的 ~95 MB 与
+        ARM64 的 ~96 MB 都是网络依赖，会让 CI 又慢又 flaky。新增 `build\ci-payload.ps1`
+        生成一个**合成载荷**：一个只含单个 `claude.exe` 条目的合法 zip（169 B）+ 匹配的
+        `SHASUMS256.txt`。于是 `build.ps1` 的 prep/pack/verify 与安装器的载荷检查
+        （trailer 魔数 + zip 条目 + 区间 SHA256）**都真实跑通**，且**零网络依赖**。
+        真实载荷的完整性仍由 `build\build.bat` 在有真载荷时强制（SHA256 不符即拒绝构建）。
+        脚本有护栏：载荷已存在时**不覆盖**（除非 `-Force`），本地手跑不会毁掉真载荷
+        （本机 `payload\claude-win32-x64.zip` 未被触碰）。
+      - **明确未纳入 CI**（理由写在 workflow 头部注释）：`build\test.bat` / E2E
+        （写 ~211 MB、依赖卸载行为、有动环境变量的历史）与 ARM64 载荷下载。
+      - **本地验证（先跑通再推，在全新克隆里做，与 CI 同为干净克隆）**：把仓库
+        `git clone -b autowork/2026-10-16` 到 `%TEMP%` 下的临时目录，按 workflow 顺序逐步跑，
+        **四步退出码全 0**：① `build\unit.bat` → **62 用例 / 178 断言全绿**；
+        ② `build\ci-payload.ps1` → 合成载荷 169 B；③ `build\build.bat` → **BUILD OK**、
+        `trailer OK`、`embedded payload matches`；④ `--selftest` → 退出码 0。
+        **AW-16 复验**：干净克隆里 stub 正确落在 `build\work\BuildInfo.stub.cs`（553 B），
+        `src\BuildInfo.cs` **未生成**（**显式 `ls` 确认不存在**，不靠 `git status`）。
+      - **CI 实际运行结果（GitHub API 查证，非推测）**：run id **39012838712**，
+        branch `autowork/2026-10-16`，head sha `13cb8b2`，**status=completed /
+        conclusion=success**，耗时约 16s
+        （`https://github.com/q2815798751/claude-code-windows-installer/actions/runs/39012838712`）。
+        逐步全部 success：Checkout → Unit tests → Create synthetic CI payload →
+        Build installer → Self-test。runner 日志实测：`test methods : 62` /
+        `assertions : 178 (passed 178, failed 0)` / `UNIT RESULT: PASS`；
+        `BUILD OK ... size: 132289 bytes`；selftest **`汇总: 通过 9 / 提示 1 / 警告 0 /
+        不通过 0`**、`架构: AMD64`、`Git Bash: C:\Program Files\Git\bin\bash.exe`、
+        `结论: 环境可用于安装。`（runner 上 0 阻断性失败）。
+      - **红线**：未跑 E2E、未触碰 `HKCU\Environment`（CI 里也明确排除 test.bat）；
+        未引入任何第三方依赖或 action（只用 `actions/checkout@v4`）；
+        新增文件保持 ASCII-only（`LC_ALL=C grep -c '[^ -~]'` = 0）；
+        显式 `ls` 确认 `src\BuildInfo.cs` 仍在（858 B，未被 stub 污染）；
+        未碰 `main`、未 force push。**无卡点**。
 
 ## 待确认（不要擅自做，等用户拍板）
 
