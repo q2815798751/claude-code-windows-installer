@@ -76,6 +76,58 @@ namespace ClaudeCodeSetup
         internal const string UninstallerName = "Uninstall.exe";
 
         // ─────────────────────────────────────────────────────────
+        // AW-10：ARM64 下载临时文件的命名与清理
+        // ─────────────────────────────────────────────────────────
+        // 旧实现把 ARM64 载荷下载到 %TEMP%\claude-arm64-<随机8位>.zip，且只在 finally 里删除。
+        // 进程被杀（用户取消、任务管理器结束、断电）时 finally 不会执行，约 96 MB 临时文件残留；
+        // 因为文件名带随机 GUID，下一轮安装**无法定位**它，残留永远无人认领。
+        //
+        // 契约（本项修复）：
+        //   - 命名**可预测**：固定的 Arm64TempZipName（不含随机数），因此上一轮的任何残留
+        //     都能被下一次安装用同一个名字找到并删除。
+        //   - **下载之前**先清理同名旧文件（PrepareArm64TempZip），把上一轮被杀留下的残留
+        //     回收，而不是只依赖 finally（它只在正常退出时运行）。两条路径互补。
+        //
+        // 为什么不用 FileOptions.DeleteOnClose？DeleteOnClose 只在**文件句柄**关闭时删除，
+        // 而下载（Net.DownloadFile 按路径写）与解压（ZipFile.OpenRead 二次打开）分属不同句柄；
+        // 要让“崩溃后回收”成立就得让该句柄一直活到解压结束，改动面远大于固定名 + 预清理，
+        // 且 FileShare 语义会让二次打开失败。故采用固定名 + 下载前清理（改动小、可测）。
+        internal const string Arm64TempZipName = "claude-arm64-payload.zip";
+
+        /// <summary>
+        /// AW-10：ARM64 下载临时 zip 的**可预测**路径（固定文件名，不含随机数）。
+        /// </summary>
+        internal static string Arm64TempZipPath(string tempDir)
+        {
+            return Path.Combine(tempDir, Arm64TempZipName);
+        }
+
+        /// <summary>
+        /// AW-10：删除指定路径上的上一轮残留临时 zip。存在则删除并返回 true，
+        /// 不存在或无权限时返回 false（best-effort，绝不抛出）。
+        /// </summary>
+        internal static bool CleanStaleTempZip(string path, IFileOps fs)
+        {
+            try
+            {
+                if (fs.FileExists(path)) { fs.DeleteFile(path); return true; }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// AW-10：准备 ARM64 下载的临时 zip 路径，并在**下载之前**清理上一轮残留。
+        /// 返回可预测的固定路径，交给 Net.DownloadFile 写入。
+        /// </summary>
+        internal static string PrepareArm64TempZip(string tempDir, IFileOps fs)
+        {
+            string path = Arm64TempZipPath(tempDir);
+            CleanStaleTempZip(path, fs);
+            return path;
+        }
+
+        // ─────────────────────────────────────────────────────────
         // 安装
         // ─────────────────────────────────────────────────────────
         internal static InstallResult Install(string selfPath, InstallOptions opt,
@@ -120,8 +172,11 @@ namespace ClaudeCodeSetup
                     Log.Write("ARM64 架构：从官方 release 下载载荷");
                     Log.Write("URL: " + url);
 
-                    tmpZip = Path.Combine(Path.GetTempPath(),
-                        "claude-arm64-" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".zip");
+                    // AW-10：可预测的固定临时文件名 + **下载前**清理上一轮残留。
+                    // 若上一次安装被杀（finally 未执行）留下约 96 MB 的残留 zip，这里会用
+                    // 同一个名字定位并删除它，避免残留无限累积。
+                    tmpZip = PrepareArm64TempZip(Path.GetTempPath(), new RealFileOps());
+                    Log.Write("ARM64 临时载荷: " + tmpZip + "（下载前已清理上一轮同名残留）");
 
                     Report(progress, log, 5, "下载 ARM64 载荷…");
                     string dlErr;

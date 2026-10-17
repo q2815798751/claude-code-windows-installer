@@ -950,6 +950,57 @@ namespace ClaudeCodeSetup
                   "a dir containing manifest.json is an overwrite install");
         }
 
+        // ---- AW-10: ARM64 download temp zip naming / cleanup ----------------
+        //
+        // The ARM64 payload used to be downloaded to %TEMP%\claude-arm64-<random8>.zip
+        // and deleted only in a finally block. A killed process (user cancel, Task
+        // Manager, power loss) skips finally, leaving ~96 MB behind under a random
+        // name that no later run can ever find. The fix uses a fixed, predictable
+        // name and removes any leftover BEFORE downloading. These tests exercise the
+        // pure naming/cleanup logic with an injected in-memory IFileOps (no real
+        // 96 MB download, no real temp file).
+        private static void Test_Arm64TempZipPath_Predictable()
+        {
+            string a = InstallerCore.Arm64TempZipPath("C:\\Temp");
+            string b = InstallerCore.Arm64TempZipPath("C:\\Temp");
+
+            Eq(a, b, "the temp zip path is deterministic across calls (no random GUID)");
+            Eq("C:\\Temp\\claude-arm64-payload.zip", a, "the temp zip name is the fixed, predictable one");
+            Check(a.EndsWith(".zip", StringComparison.OrdinalIgnoreCase), "the temp payload is a .zip");
+            Eq("claude-arm64-payload.zip",
+               Path.GetFileName(InstallerCore.Arm64TempZipPath("D:\\Other")),
+               "the file name is independent of the temp dir (findable on the next run)");
+        }
+
+        private static void Test_CleanStaleTempZip()
+        {
+            string path = InstallerCore.Arm64TempZipPath("C:\\Temp");
+
+            FakeFileOps none = new FakeFileOps();
+            Check(!InstallerCore.CleanStaleTempZip(path, none),
+                  "no leftover -> CleanStaleTempZip reports nothing removed");
+
+            FakeFileOps stale = new FakeFileOps();
+            stale.Files[path] = "STALE-96MB-PAYLOAD";
+            Check(InstallerCore.CleanStaleTempZip(path, stale),
+                  "an existing leftover -> CleanStaleTempZip reports it removed");
+            Check(!stale.FileExists(path), "the leftover file is gone afterwards");
+        }
+
+        private static void Test_PrepareArm64TempZip_CleansLeftover()
+        {
+            string path = InstallerCore.Arm64TempZipPath("C:\\Temp");
+
+            FakeFileOps fs = new FakeFileOps();
+            fs.Files[path] = "STALE-96MB-PAYLOAD-FROM-A-KILLED-RUN";
+
+            string got = InstallerCore.PrepareArm64TempZip("C:\\Temp", fs);
+
+            Eq(path, got, "PrepareArm64TempZip returns the predictable fixed path");
+            Check(!fs.FileExists(path),
+                  "the download step is reached with the previous run's leftover already removed");
+        }
+
         // ---------------------------------------------------------------- main
 
         internal static int Main(string[] args)
@@ -1019,6 +1070,10 @@ namespace ClaudeCodeSetup
             Run("Rollback_OverwriteKeepsExistingInstall", Test_Rollback_OverwriteKeepsExistingInstall);
             Run("Rollback_FreshInstallDeletesDir", Test_Rollback_FreshInstallDeletesDir);
             Run("IsOverwriteInstall", Test_IsOverwriteInstall);
+
+            Run("Arm64TempZipPath_Predictable", Test_Arm64TempZipPath_Predictable);
+            Run("CleanStaleTempZip", Test_CleanStaleTempZip);
+            Run("PrepareArm64TempZip_CleansLeftover", Test_PrepareArm64TempZip_CleansLeftover);
 
             Console.WriteLine("--------------------------------------");
             Console.WriteLine("test methods : " + _methods);
